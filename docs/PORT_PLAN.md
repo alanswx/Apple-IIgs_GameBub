@@ -303,6 +303,32 @@ checked against the model. What it took:
   same picture upstream's simulator shows there, with 62.5 M SDRAM reads,
   62 M CPU reads and 4.2 MB of sector data all correct.
 
+### Phase 5: game database (2026-10-12)
+
+Built as section 6 describes, with these choices:
+
+* `gamedb/games.tsv` columns: `crc32 title rom speed input buttons notes`.
+  `tools/mkgamedb.py` checks it and writes `gamedb.bin` (format in its
+  docstring); `--crc disk.woz` prints a disk's key. `scripts/package.sh`
+  builds it into the SD-card zip next to the bitstream.
+* Records are 16 bytes, one 8-word SDRAM burst each (the ch2 line read the
+  block device already uses). `rtl/gamebub/gb_gamedb.sv` reads the disk's
+  WOZ header, then scans the file linearly. It starts on SetupComplete, and
+  `gb_host` answers GetStatus with "setup" until it is done, so the IIgs is
+  released with the game's settings in place. Sim: 3 us for 2 records,
+  2 ms for a full 64 KiB file (4095 records); the firmware waits 100 ms.
+* Settings precedence: ROM, CPU Speed and Start In each have an "Auto (game
+  list)" entry, the default. Auto takes the game's value, else ROM 3 if
+  present, 2.8 MHz, mouse mode. An explicit menu choice overrides the game
+  list. A game asking for ROM 01 when the card has none gets ROM 3.
+* Buttons A, B, X, Y, L, R and Start each type one key (any key
+  `rtl/iigs/adb.sv` translates, or none). The d-pad stays arrows / mouse /
+  joystick and Select toggles mouse and keyboard mode, as before.
+* Unknown disk: the defaults, and its CRC is word 3 of the PMOD beacon
+  (word 6 bit 5 = found, bit 4 = lookup done).
+* Not done yet: per-game mouse speed, joystick-only mode, settings actions
+  for extra keys.
+
 ## 10. Open questions
 
 * ~~Does a missing optional `dependent_on_0` file get skipped cleanly?~~

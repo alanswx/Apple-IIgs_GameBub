@@ -22,6 +22,10 @@ and framework constraints, the block-RAM budget, the reuse list and the phases.
   +disk=scratch/roms/game.woz +frames=600 +dump=50 +raw`. About 3 s of wall
   time per IIgs frame. `scripts/ppm2png.py sim_out/*.ppm` converts frames.
   `python3 scripts/import_iigs.py` re-imports `rtl/iigs/` from upstream.
+* Per-game settings live in `gamedb/games.tsv`; `tools/mkgamedb.py` builds
+  `build/gamedb.bin` (`--crc disk.woz` prints a disk's key; the testbench
+  takes `+gamedb=build/gamedb.bin`). `scripts/package.sh` zips the SD-card
+  folder (metadata, bitstream, gamedb.bin) into `releases/`.
 * Chisel elaboration alone (prints the `iigs_gamebub` port template, no
   Vivado): `./mill -i --no-build-lock root.runMain platform.handheld.HandheldTop
   AppleIIgs 4 --target-dir=<dir>`.

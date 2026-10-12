@@ -72,6 +72,14 @@ module gb_host (
 	// ---- settings for the input layer ----
 	output wire        ptr_default,      // start in pointer (mouse) mode
 
+	// ---- game database (gb_gamedb) ----
+	output reg         db_start,         // pulse: look the disk up (SetupComplete)
+	input  wire        db_done,
+	input  wire        db_found,
+	input  wire  [1:0] db_rom,           // 0 auto, 1 ROM 3, 2 ROM 01
+	input  wire  [7:0] db_speed,         // 0..4, 0xFF no preference
+	input  wire  [7:0] db_input,         // 0 keyboard, 1 mouse, 0xFF no preference
+
 	// ---- file table ----
 	output reg   [4:0] file_present,
 	output wire [159:0] file_size_flat,  // {size[4], ..., size[0]}
@@ -117,18 +125,27 @@ module gb_host (
 	localparam [11:0] SET_ACT_RESET   = 12'h100;  // action: warm reset
 	localparam [11:0] SET_ACT_SWAP    = 12'h104;  // action: swap disk 1 / disk 2
 	localparam [11:0] SET_ROM         = 12'h200;  // 0 = auto, 1 = ROM 3, 2 = ROM 01
-	localparam [11:0] SET_SPEED       = 12'h204;  // host_speed 0..4
-	localparam [11:0] SET_PTR_DEFAULT = 12'h208;  // 1 = start in mouse mode
+	localparam [11:0] SET_SPEED       = 12'h204;  // host_speed 0..4, 0xF = auto
+	localparam [11:0] SET_PTR_DEFAULT = 12'h208;  // 0 keyboard, 1 mouse, 2 = auto
 
 	reg  [31:0] set_rom         = 32'd0;
-	reg  [31:0] set_speed       = 32'd0;
-	reg  [31:0] set_ptr_default = 32'd1;
+	reg  [31:0] set_speed       = 32'hF;
+	reg  [31:0] set_ptr_default = 32'd2;
 
-	// Auto: ROM 3 if the card has it, else ROM 01.
+	// "Auto" settings take the game database's choice for this disk
+	// (gb_gamedb), else: ROM 3 if the card has it, else ROM 01; normal
+	// speed; mouse mode.
+	wire db_rom3  = db_found && db_rom == 2'd1 && file_present[FILE_ROM3];
+	wire db_rom01 = db_found && db_rom == 2'd2 && file_present[FILE_ROM01];
 	assign rom_select  = (set_rom[1:0] == 2'd2) ||
-	                     (set_rom[1:0] == 2'd0 && !file_present[FILE_ROM3] && file_present[FILE_ROM01]);
-	assign host_speed  = (set_speed[2:0] > 3'd4) ? 3'd4 : set_speed[2:0];
-	assign ptr_default = set_ptr_default[0];
+	                     (set_rom[1:0] == 2'd0 && !db_rom3 &&
+	                      (db_rom01 || (!file_present[FILE_ROM3] && file_present[FILE_ROM01])));
+	assign host_speed  = (set_speed[3:0] == 4'hF) ?
+	                         ((db_found && db_speed <= 8'd4) ? db_speed[2:0] : 3'd0) :
+	                     (set_speed[2:0] > 3'd4) ? 3'd4 : set_speed[2:0];
+	assign ptr_default = (set_ptr_default[1:0] == 2'd2) ?
+	                         ((db_found && db_input <= 8'd1) ? db_input[0] : 1'b1) :
+	                     set_ptr_default[0];
 
 	// ---------------------------------------------------------------------
 	// Core state
@@ -141,7 +158,7 @@ module gb_host (
 	wire        rom_loaded = file_present[FILE_ROM3] || file_present[FILE_ROM01];
 
 	assign file_size_flat = {file_size[4], file_size[3], file_size[2], file_size[1], file_size[0]};
-	assign core_reset     = !(run && rom_loaded);
+	assign core_reset     = !(run && rom_loaded && db_done);
 
 	// ---------------------------------------------------------------------
 	// Command channel
@@ -207,6 +224,7 @@ module gb_host (
 			12'h81C:          local_read = file_size[3];
 			12'h820:          local_read = file_size[4];
 			12'h824:          local_read = dbg_blockdev;
+			12'h828:          local_read = {29'd0, db_found, db_done, setup_done};
 			default:          local_read = 32'd0;
 		endcase
 	endfunction
@@ -226,6 +244,7 @@ module gb_host (
 			run          <= 1'b0;
 			run_d        <= 1'b0;
 			mount_req    <= 1'b0;
+			db_start     <= 1'b0;
 			act_reset    <= 1'b0;
 			act_swap     <= 1'b0;
 			focus        <= 1'b0;
@@ -236,6 +255,7 @@ module gb_host (
 		end else begin
 			mem_done  <= 1'b0;
 			mount_req <= 1'b0;
+			db_start  <= 1'b0;
 			act_reset <= 1'b0;
 			act_swap  <= 1'b0;
 
@@ -324,11 +344,15 @@ module gb_host (
 					cmd_state  <= CS_DONE;
 					cmd_reg[0] <= 32'd0;
 					case (opcode)
+					// The firmware waits for "halted" after SetupComplete: not
+					// before the game database lookup has finished.
 					CMD_GET_STATUS:
-						cmd_reg[0] <= !setup_done ? STATUS_SETUP :
+						cmd_reg[0] <= (!setup_done || !db_done) ? STATUS_SETUP :
 						              run         ? STATUS_CORE_RUN : STATUS_CORE_HALT;
-					CMD_SETUP_COMPLETE:
+					CMD_SETUP_COMPLETE: begin
 						setup_done <= 1'b1;
+						db_start   <= 1'b1;
+					end
 					CMD_CORE_RUN:
 						run <= 1'b1;
 					CMD_CORE_HALT:

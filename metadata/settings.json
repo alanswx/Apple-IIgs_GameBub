@@ -21,7 +21,7 @@
 			"type": "list",
 			"default": "0x0",
 			"items": [
-				{"label": "Auto", "value": "0x0"},
+				{"label": "Auto (game list)", "value": "0x0"},
 				{"label": "ROM 3", "value": "0x1"},
 				{"label": "ROM 01", "value": "0x2"}
 			]
@@ -31,8 +31,9 @@
 			"label": "CPU Speed",
 			"address": "0x00000204",
 			"type": "list",
-			"default": "0x0",
+			"default": "0xF",
 			"items": [
+				{"label": "Auto (game list)", "value": "0xF"},
 				{"label": "2.8 MHz (normal)", "value": "0x0"},
 				{"label": "3.6 MHz", "value": "0x1"},
 				{"label": "4.8 MHz", "value": "0x2"},
@@ -45,8 +46,9 @@
 			"label": "Start In",
 			"address": "0x00000208",
 			"type": "list",
-			"default": "0x1",
+			"default": "0x2",
 			"items": [
+				{"label": "Auto (game list)", "value": "0x2"},
 				{"label": "Mouse Mode", "value": "0x1"},
 				{"label": "Keyboard Mode", "value": "0x0"}
 			]

@@ -20,8 +20,9 @@
 //   +rom01=<file>   ROM 01 image, 128 KiB (optional; loaded when given)
 //   +no_rom3        do not load ROM 3 (ROM 01 only)
 //   +disk=<file>    disk 1 (WOZ)          +disk2=<file>  disk 2 (WOZ)
-//   +speed=<n>      CPU speed setting 0..4
-//   +kbd_mode       start the pad in keyboard mode
+//   +gamedb=<file>  game database (tools/mkgamedb.py; file 4)
+//   +speed=<n>      CPU speed setting 0..4, 15 = auto (the default)
+//   +kbd_mode       start the pad in keyboard mode (default: auto)
 //   +frames=<n>     stop after n frames (default 300)
 //   +dump=<k>       write every k-th frame (default 25)
 //   +raw            also dump the VGC's raw output (whole line, border included)
@@ -703,8 +704,9 @@ module tb_gamebub #(
 	// -------------------------------------------------------------------
 	// The MCU's core-load sequence
 	// -------------------------------------------------------------------
-	string rom3_path, rom01_path, disk_path, disk2_path;
-	integer len, speed;
+	string rom3_path, rom01_path, disk_path, disk2_path, gamedb_path;
+	integer len, speed, polls;
+	longint t_setup;
 	reg [31:0] r;
 	initial begin
 		if (!$value$plusargs("rom3=%s", rom3_path)) rom3_path = "scratch/roms/boot.rom";
@@ -712,6 +714,7 @@ module tb_gamebub #(
 		if (!$value$plusargs("rom01=%s", rom01_path)) rom01_path = "";
 		if (!$value$plusargs("disk=%s", disk_path)) disk_path = "";
 		if (!$value$plusargs("disk2=%s", disk2_path)) disk2_path = "";
+		if (!$value$plusargs("gamedb=%s", gamedb_path)) gamedb_path = "";
 		if (!$value$plusargs("frames=%d", max_frames)) max_frames = 300;
 		if (!$value$plusargs("dump=%d", dump_every)) dump_every = 25;
 		if (!$value$plusargs("out=%s", out_dir)) out_dir = "sim_out";
@@ -731,6 +734,9 @@ module tb_gamebub #(
 
 		if (rom3_path != "")  load_file(2, rom3_path,  32'h10FC_0000, len);
 		if (rom01_path != "") load_file(3, rom01_path, 32'h10F8_0000, len);
+		// (before the disks: the block-device check compares against the
+		// last file loaded, which stays in filebuf)
+		if (gamedb_path != "") load_file(4, gamedb_path, 32'h1180_0000, len);
 		if (disk_path != "")  load_file(0, disk_path,  32'h1100_0000, len);
 		if (disk2_path != "") load_file(1, disk2_path, 32'h1140_0000, len);
 		bd_check = (disk_path != "" && disk2_path == "");
@@ -739,9 +745,21 @@ module tb_gamebub #(
 			$finish;
 		end
 
+		t_setup = $time;
 		host_cmd(16'h0102, 0, 0, 0, r);           // SetupComplete
-		host_cmd(16'h0000, 0, 0, 0, r);
-		$display("TB: GetStatus = %0d (expect 3 = halted)", r);
+		// The firmware polls until the core reports halted (100 ms limit):
+		// the game database lookup runs in between.
+		polls = 0;
+		do begin
+			host_cmd(16'h0000, 0, 0, 0, r);
+			polls++;
+		end while (r == 2 && polls < 10000);
+		$display("TB: GetStatus = %0d (expect 3 = halted) after %0d polls, %0d us after SetupComplete (firmware limit 100000)",
+		         r, polls, ($time - t_setup) / 1_000_000);
+		if (r != 3) $display("TB ERROR: core never reported halted");
+		$display("TB: gamedb found=%0d crc=%08h rom=%0d speed=%0d input=%0d keymap=%016h -> rom_select=%0d host_speed=%0d ptr_default=%0d",
+		         dut.db_found, dut.db_crc, dut.db_rom, dut.db_speed, dut.db_input, dut.db_keymap,
+		         dut.rom_select, dut.host_speed, dut.ptr_default);
 		host_cmd(16'h0200, 1, 0, 0, r);           // NotifyFocus(1)
 		host_cmd(16'h0100, 0, 0, 0, r);           // CoreRun
 		host_cmd(16'h0000, 0, 0, 0, r);

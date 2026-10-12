@@ -109,6 +109,11 @@ module iigs_gamebub (
 	wire  [4:0] file_present;
 	wire [159:0] file_size_flat;
 	wire [31:0] dbg_blockdev, dbg_host_state, dbg_woz_magic;
+	wire        db_start, db_done, db_found;
+	wire  [1:0] db_rom;
+	wire  [7:0] db_speed, db_input;
+	wire [31:0] db_crc;
+	wire [62:0] db_keymap;
 
 	wire        host_sd_req, host_sd_we, host_sd_ack;
 	wire [23:0] host_sd_addr;
@@ -140,6 +145,12 @@ module iigs_gamebub (
 		.mount_req      (mount_req),
 		.focus          (focus),
 		.ptr_default    (ptr_default),
+		.db_start       (db_start),
+		.db_done        (db_done),
+		.db_found       (db_found),
+		.db_rom         (db_rom),
+		.db_speed       (db_speed),
+		.db_input       (db_input),
 		.file_present   (file_present),
 		.file_size_flat (file_size_flat),
 		.dbg_blockdev   (dbg_blockdev),
@@ -206,15 +217,61 @@ module iigs_gamebub (
 		.dbg          (dbg_blockdev)
 	);
 
-	// Host window (files) and block device share SDRAM ch2.
+	// ---------------------------------------------------------------------
+	// Game database: the disk's per-game settings (tools/mkgamedb.py),
+	// looked up after SetupComplete, before the IIgs is released.
+	// ---------------------------------------------------------------------
+	localparam [23:0] GAMEDB_WORD = 24'hC0_0000;  // byte 0x180_0000
+
+	wire        db_sd_req, db_sd_ack;
+	wire [23:0] db_sd_addr;
+	gb_gamedb gamedb (
+		.clk          (clk_sys),
+		.reset        (reset),
+		.start        (db_start),
+		.disk_present (file_present[0]),
+		.db_present   (file_present[4]),
+		.disk_word    (DISK1_WORD),
+		.db_word      (GAMEDB_WORD),
+		.db_bytes     (file_size_flat[159:128]),
+		.mem_req      (db_sd_req),
+		.mem_addr     (db_sd_addr),
+		.mem_ack      (db_sd_ack),
+		.mem_line     (pm_line),
+		.done         (db_done),
+		.found        (db_found),
+		.crc          (db_crc),
+		.rom          (db_rom),
+		.speed        (db_speed),
+		.input_mode   (db_input),
+		.keymap       (db_keymap)
+	);
+
+	// Host window (files) and the lookup (only ever one at a time: the
+	// lookup starts after SetupComplete), then those and the block device,
+	// share SDRAM ch2.
+	wire        hd_req, hd_we, hd_ack;
+	wire [23:0] hd_addr;
+	wire [15:0] hd_din;
+	gb_eth_arb hd_arb (
+		.clk    ( clk_sys ),
+		.reset  ( reset ),
+		.a_req  ( host_sd_req ), .a_we ( host_sd_we ), .a_addr ( host_sd_addr ),
+		.a_din  ( host_sd_din ), .a_ack ( host_sd_ack ), .a_dout ( ),
+		.b_req  ( db_sd_req ),   .b_we ( 1'b0 ),       .b_addr ( db_sd_addr ),
+		.b_din  ( 16'd0 ),       .b_ack ( db_sd_ack ), .b_dout ( ),
+		.m_req  ( hd_req ),      .m_we ( hd_we ),      .m_addr ( hd_addr ),
+		.m_din  ( hd_din ),      .m_ack ( hd_ack ),    .m_dout ( 16'd0 )
+	);
+
 	wire        pm_req, pm_we, pm_ack;
 	wire [23:0] pm_addr;
 	wire [15:0] pm_din, pm_dout;
 	gb_eth_arb pm_arb (
 		.clk    ( clk_sys ),
 		.reset  ( reset ),
-		.a_req  ( host_sd_req ), .a_we ( host_sd_we ), .a_addr ( host_sd_addr ),
-		.a_din  ( host_sd_din ), .a_ack ( host_sd_ack ), .a_dout ( ),
+		.a_req  ( hd_req ),      .a_we ( hd_we ),      .a_addr ( hd_addr ),
+		.a_din  ( hd_din ),      .a_ack ( hd_ack ),    .a_dout ( ),
 		.b_req  ( bd_sd_req ),   .b_we ( bd_sd_we ),   .b_addr ( bd_sd_addr ),
 		.b_din  ( bd_sd_din ),   .b_ack ( bd_sd_ack ), .b_dout ( bd_sd_dout ),
 		.m_req  ( pm_req ),      .m_we ( pm_we ),      .m_addr ( pm_addr ),
@@ -223,7 +280,9 @@ module iigs_gamebub (
 
 	// ---------------------------------------------------------------------
 	// Input: Game Bub buttons in the Pocket cont1_key layout. Select
-	// toggles mouse / keyboard mode (gb_pad_input). The d-pad also drives
+	// toggles mouse / keyboard mode (gb_pad_input). A..Start type the keys
+	// the game database gives this disk, else the defaults below (keep them
+	// in step with tools/mkgamedb.py DEFAULT_MAP). The d-pad also drives
 	// the joystick, full deflection; L and R are Open Apple and Option,
 	// which the IIgs reads as joystick buttons 0 and 1 too.
 	// ---------------------------------------------------------------------
@@ -242,6 +301,19 @@ module iigs_gamebub (
 		input_buttons_down,    // 1
 		input_buttons_up       // 0
 	};
+	// {start, r, l, y, x, b, a}, PS/2 set 2 scancodes (bit 8 = E0),
+	// translated by rtl/iigs/adb.sv
+	localparam [62:0] DEFAULT_KEYMAP = {
+		9'h05A,   // Start: Return
+		9'h11F,   // R: Left GUI -> Option (joystick button 1)
+		9'h011,   // L: Left Alt -> Open Apple (joystick button 0)
+		9'h035,   // Y: Y
+		9'h076,   // X: Escape
+		9'h029,   // B: Space
+		9'h05A    // A: Return (mouse button in pointer mode)
+	};
+	wire [62:0] keymap = db_found ? db_keymap : DEFAULT_KEYMAP;
+
 	wire [10:0] ps2_key;
 	wire [24:0] ps2_mouse;
 	gb_pad_input #(
@@ -252,14 +324,13 @@ module iigs_gamebub (
 		// mode" setting written during setup takes effect
 		.reset       (reset || core_reset),
 		.cont1_key   (cont1_key),
-		// PS/2 Set 2 scancodes (bit 8 = E0), translated by rtl/iigs/adb.sv
-		.map_a       (9'h05A),   // Return  (mouse button in pointer mode)
-		.map_b       (9'h029),   // Space
-		.map_x       (9'h076),   // Escape
-		.map_y       (9'h035),   // Y
-		.map_l       (9'h011),   // Left Alt  -> Open Apple (button 0)
-		.map_r       (9'h11F),   // Left GUI  -> Option     (button 1)
-		.map_start   (9'h05A),   // Return
+		.map_a       (keymap[8:0]),
+		.map_b       (keymap[17:9]),
+		.map_x       (keymap[26:18]),
+		.map_y       (keymap[35:27]),
+		.map_l       (keymap[44:36]),
+		.map_r       (keymap[53:45]),
+		.map_start   (keymap[62:54]),
 		.ps2_key     (ps2_key),
 		.ps2_mouse   (ps2_mouse),
 		.ptr_default (ptr_default),
@@ -370,10 +441,12 @@ module iigs_gamebub (
 	// Debug beacon (PMOD pin 3). Words, in order:
 	//   0  gb_host state: "GS" | engine state, file_present[4:0], rom, run, setup
 	//   1  first word of disk 1 ("WOZ2" = 325A4F57)
-	//   2  disk 1 size (bytes)       3  ROM 3 size (bytes)
+	//   2  disk 1 size (bytes)
+	//   3  the disk's WOZ CRC32, the game database key (add unknown disks)
 	//   4  block device {writes, reads}
 	//   5  {disk_sel, rom_select, host_speed, focus, core_reset, CPU reset, CPU address}
-	//   6  {frames[15:0], 11'd0, IDELAYCTRL ready, disk {motor, busy, ready, mounted}}
+	//   6  {frames[15:0], 9'd0, game found, lookup done, IDELAYCTRL ready,
+	//       disk {motor, busy, ready, mounted}}
 	//   7  "IIGS"
 	// ---------------------------------------------------------------------
 	reg [15:0] frames = 16'd0;
@@ -388,10 +461,10 @@ module iigs_gamebub (
 		.reset (reset),
 		.words ({
 			32'h49494753,
-			{frames, 11'd0, idelay_ready, dbg_disk},
+			{frames, 9'd0, db_found, db_done, idelay_ready, dbg_disk},
 			{disk_sel, rom_select, host_speed, focus, core_reset, dbg_core_reset, dbg_addr},
 			dbg_blockdev,
-			file_size_flat[95:64],
+			db_crc,
 			file_size_flat[31:0],
 			dbg_woz_magic,
 			dbg_host_state
