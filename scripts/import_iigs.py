@@ -243,6 +243,13 @@ def patch_default_nettype(text, src):
     return text.rstrip("\n") + "\n// [gamebub] restore the default for the files compiled after this one\n`default_nettype wire\n"
 
 
+def patch_es5503(text, src):
+    """`ca` is an output port assigned in an always block but declared as a
+    wire; Quartus and Verilator accept that, Vivado rejects it (Synth 8-2577)."""
+    return replace_once(text, "    output [3:0]      ca,\n",
+                        "    output reg [3:0]  ca,   // [gamebub] reg for Vivado\n", "es5503.v ca")
+
+
 def patch_sdram_ch2_read(text):
     """Single-word reads on ch2 (wrl2 = wrh2 = 0), like ch3's.
 
@@ -290,6 +297,7 @@ def patch_sdram_burst(text, src):
     - The framework splits the data bus into dataOut/dataIn/dataDir, so the
       controller drives an explicit output enable instead of a tristate.
     - The inverted SDRAM clock comes from an ODDR (was altddio_out).
+    - The data bus output enable rises at the start of a write round.
     """
     text = replace_once(
         text,
@@ -309,6 +317,19 @@ def patch_sdram_burst(text, src):
     )
     text = replace_once(text, "        dq_in <= SDRAM_DQ;\n", "        dq_in <= SDRAM_DQ_IN;\n",
                         "sdram_burst read capture")
+    # dq_oe is one register driving 16 pad tristates (the framework has a
+    # single dataDir), so it cannot be packed into the I/O blocks, and from
+    # the fabric it missed the chip's write setup by 0.3 ns. The chip ignores
+    # DQ until the WRITE, so enable the bus from the start of the write round,
+    # three clocks early; rtl/gamebub/iigs.xdc makes the path multicycle. No
+    # read is in flight then: a read round ends with its last beat long gone.
+    text = replace_once(
+        text,
+        "        dq_oe <= 1'b0;\n",
+        "        // [gamebub] bus enabled from STATE_START of a write round (see iigs.xdc)\n"
+        "        dq_oe <= (mode == MODE_NORMAL) && active && we && (state >= STATE_START) && (state < STATE_CONT);\n",
+        "sdram_burst early dq_oe",
+    )
     text = patch_sdram_ch2_read(text)
     start = text.index("    altddio_out #(\n")
     end = text.index(");\n", text.index("sdramclk_ddr (", start)) + len(");\n")
@@ -328,6 +349,7 @@ PATCHES = {
     "rtl/vgc.v": patch_vgc,
     "rtl/adb.v": patch_adb,
     "rtl/prtc.v": patch_prtc,
+    "rtl/es5503.v": patch_es5503,
     "rtl/uart/rxuart.v": patch_default_nettype,
     "rtl/uart/txuart.v": patch_default_nettype,
     "rtl/sdram_burst.sv": patch_sdram_burst,

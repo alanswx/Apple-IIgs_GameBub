@@ -18,7 +18,7 @@ module MMCME2_BASE #(
 	parameter integer CLKOUT2_DIVIDE = 9,
 	parameter integer CLKOUT3_DIVIDE = 6,
 	parameter integer CLKOUT4_DIVIDE = 36,
-	parameter integer CLKOUT5_DIVIDE = 1,
+	parameter integer CLKOUT5_DIVIDE = 5,
 	parameter integer CLKOUT6_DIVIDE = 1,
 	parameter real CLKOUT0_PHASE = 0.0, parameter real CLKOUT1_PHASE = 0.0,
 	parameter real CLKOUT2_PHASE = 0.0, parameter real CLKOUT3_PHASE = 0.0,
@@ -42,6 +42,7 @@ module MMCME2_BASE #(
 	assign CLKOUT2B = ~CLKOUT2;
 	// SPI and LCD clocks only feed the framework, which is not simulated.
 	assign CLKOUT3 = 1'b0; assign CLKOUT3B = 1'b1;
+	// The IDELAYCTRL reference clock only matters in hardware.
 	assign CLKOUT4 = 1'b0; assign CLKOUT5 = 1'b0; assign CLKOUT6 = 1'b0;
 	initial begin
 		#100000 LOCKED = 1;
@@ -66,4 +67,29 @@ module ODDR #(
 );
 	// Clock-forwarding use only (D1/D2 constant): Q = C or ~C.
 	assign Q = C ? D1 : D2;
+endmodule
+
+// SDRAM read delays (gb_sdram_idelay.sv): no delay in simulation; the
+// testbench's SDRAM model sets the read data timing directly.
+module IDELAYCTRL (input REFCLK, input RST, output RDY);
+	assign RDY = !RST;
+endmodule
+
+module IDELAYE2 #(
+	parameter CINVCTRL_SEL = "FALSE",
+	parameter DELAY_SRC = "IDATAIN",
+	parameter HIGH_PERFORMANCE_MODE = "TRUE",
+	parameter IDELAY_TYPE = "FIXED",
+	parameter integer IDELAY_VALUE = 0,
+	parameter PIPE_SEL = "FALSE",
+	parameter real REFCLK_FREQUENCY = 200.0,
+	parameter SIGNAL_PATTERN = "DATA"
+)(
+	input C, CE, CINVCTRL, DATAIN, IDATAIN, INC, LD, LDPIPEEN, REGRST,
+	input [4:0] CNTVALUEIN,
+	output [4:0] CNTVALUEOUT,
+	output DATAOUT
+);
+	assign DATAOUT = IDATAIN;
+	assign CNTVALUEOUT = IDELAY_VALUE;
 endmodule

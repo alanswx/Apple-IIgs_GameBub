@@ -6,7 +6,9 @@
 // build prints the template if they ever change). This file only wires the
 // platform layer around the machine:
 //
-//   gb_clocks      one MMCM: sys 14.32, vid 28.64, mem 114.6, SPI 171.9, LCD 28.64
+//   gb_clocks      one MMCM: sys 14.32, vid 28.64, mem 114.6, SPI 171.9, LCD 28.64,
+//                  IDELAY reference 206.25
+//   gb_sdram_idelay  input delays on the SDRAM data pins
 //   gb_host        HostV0 commands, settings, file window into SDRAM
 //   gb_blockdev    the 3.5" drive's sectors, served from the WOZ in SDRAM
 //   gb_pad_input   12 buttons -> PS/2 keyboard + mouse (-> ADB)
@@ -82,7 +84,7 @@ module iigs_gamebub (
 	// ---------------------------------------------------------------------
 	// Clocks
 	// ---------------------------------------------------------------------
-	wire clk_sys, clk_vid, clk_mem, pll_locked;
+	wire clk_sys, clk_vid, clk_mem, clk_ref, pll_locked;
 	gb_clocks clocks (
 		.clk_in_50mhz (clocks_clockIn50M),
 		.clk_sys      (clk_sys),
@@ -90,6 +92,7 @@ module iigs_gamebub (
 		.clk_mem      (clk_mem),
 		.clk_spi      (clocks_clockOutSpi),
 		.clk_display  (clocks_clockOutDisplay),
+		.clk_ref      (clk_ref),
 		.locked       (pll_locked)
 	);
 	assign clocks_clockOutSystem = clk_sys;
@@ -270,6 +273,18 @@ module iigs_gamebub (
 	wire [7:0]  vid_r, vid_g, vid_b;
 	wire        vid_hblank, vid_vblank;
 	wire        sdram_dq_oe;
+	wire [15:0] sdram_dq_in;
+	wire        idelay_ready;
+
+	// SDRAM read data: a fixed input delay centres the capture window
+	// (gb_sdram_idelay.sv, rtl/gamebub/iigs.xdc).
+	gb_sdram_idelay #(.TAPS(9)) sdram_idelay (
+		.clk_ref    (clk_ref),
+		.ref_locked (pll_locked),
+		.pin_in     (sdram_dataIn),
+		.data_out   (sdram_dq_in),
+		.ready      (idelay_ready)
+	);
 	wire [23:0] dbg_addr;
 	wire        dbg_core_reset;
 	wire [3:0]  dbg_disk;
@@ -313,7 +328,7 @@ module iigs_gamebub (
 		.audio_r             (audio_right),
 		.sdram_clk           (sdram_clock),
 		.sdram_dq_out        (sdram_dataOut),
-		.sdram_dq_in         (sdram_dataIn),
+		.sdram_dq_in         (sdram_dq_in),
 		.sdram_dq_oe         (sdram_dq_oe),
 		.sdram_a             (sdram_address),
 		.sdram_dqm           (sdram_dqm),
@@ -355,7 +370,7 @@ module iigs_gamebub (
 	//   2  disk 1 size (bytes)       3  ROM 3 size (bytes)
 	//   4  block device {writes, reads}
 	//   5  {disk_sel, rom_select, host_speed, focus, core_reset, CPU reset, CPU address}
-	//   6  {frames[15:0], 12'd0, disk {motor, busy, ready, mounted}}
+	//   6  {frames[15:0], 11'd0, IDELAYCTRL ready, disk {motor, busy, ready, mounted}}
 	//   7  "IIGS"
 	// ---------------------------------------------------------------------
 	reg [15:0] frames = 16'd0;
@@ -370,7 +385,7 @@ module iigs_gamebub (
 		.reset (reset),
 		.words ({
 			32'h49494753,
-			{frames, 12'd0, dbg_disk},
+			{frames, 11'd0, idelay_ready, dbg_disk},
 			{disk_sel, rom_select, host_speed, focus, core_reset, dbg_core_reset, dbg_addr},
 			dbg_blockdev,
 			file_size_flat[95:64],

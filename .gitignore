@@ -11,8 +11,8 @@ webtalk*
 usage_statistics_webtalk.*
 
 # --- Simulation --------------------------------------------------------------
-# Verilator builds (sim/run_tb.sh; SIM_OBJ=... makes more) and their logs
-/sim/obj_dir*
+# Verilator builds (sim/run_tb.sh; SIM_OBJ=sim/obj_<x> makes more) and their logs
+/sim/obj_*
 # Frames written by the testbench (+out=<dir> defaults to sim_out)
 /sim_out*/
 # Waveforms

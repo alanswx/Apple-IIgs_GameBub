@@ -18,18 +18,29 @@ create_generated_clock -name sdram_clk -divide_by 1 -invert \
 	[get_ports sdram_clk]
 
 ## Read data: valid tAC (<= 5 ns at CL3) after a chip clock edge, held tOH
-## (>= 3 ns), plus board delay. sdram_burst's dq_in samples the beat at the
-## SECOND clk_mem edge after the chip edge that launched it (STATE_LDAT0 =
-## CONT + CL + 2), i.e. 13.1 ns later, not the default 4.4 ns.
-## The hold side of that window is the risk on this board: check it first.
+## (>= 3 ns), plus board delay. sdram_burst's dq_in samples a beat at the
+## SECOND clk_mem rising edge after the chip edge that launched it
+## (STATE_LDAT0 = CONT + CL + 2): 1.5 periods, 13.1 ns, later -- confirmed in
+## sim/tb_gamebub.sv, where a model without the I/O delays returns the next
+## word on every read. It works because the forwarded clock's ODDR + OBUF
+## and the IBUF delay the data that much. Setup is therefore checked at
+## that edge (multicycle 2). Hold stays at the default for a 2-cycle setup,
+## the edge in between (0.5 periods after launch): the beats change every
+## clock, so the next beat must not reach dq_in before that edge has taken
+## the previous one. That hold check is the margin to watch on this board.
 set_input_delay  -clock sdram_clk -max 5.5 [get_ports {sdram_dq[*]}]
 set_input_delay  -clock sdram_clk -min 2.5 [get_ports {sdram_dq[*]}]
 set_multicycle_path -setup -end 2 -from [get_clocks sdram_clk] -to [get_cells -quiet -hier -filter {NAME =~ */core/sdram/dq_in_reg*}]
-set_multicycle_path -hold  -end 1 -from [get_clocks sdram_clk] -to [get_cells -quiet -hier -filter {NAME =~ */core/sdram/dq_in_reg*}]
 
 ## Command/address/data setup tIS 1.5 ns, hold tIH 0.8 ns, plus board skew.
 set_output_delay -clock sdram_clk -max  2.0 [get_ports {sdram_a[*] sdram_bs[*] sdram_dq[*] sdram_ldqm sdram_udqm sdram_cas_n sdram_ras_n sdram_we_n sdram_cs_n[0]}]
 set_output_delay -clock sdram_clk -min -0.8 [get_ports {sdram_a[*] sdram_bs[*] sdram_dq[*] sdram_ldqm sdram_udqm sdram_cas_n sdram_ras_n sdram_we_n sdram_cs_n[0]}]
+
+## The data bus output enable (one register for all 16 pins, so in the
+## fabric) rises at the start of a write round, three clk_mem cycles before
+## the WRITE the chip samples (import patch "sdram_burst early dq_oe").
+set_multicycle_path -setup -end 2 -from [get_cells -quiet -hier -filter {NAME =~ */core/sdram/dq_oe_reg}] -to [get_ports {sdram_dq[*]}]
+set_multicycle_path -hold  -end 1 -from [get_cells -quiet -hier -filter {NAME =~ */core/sdram/dq_oe_reg}] -to [get_ports {sdram_dq[*]}]
 
 ## Registers in the I/O blocks, so pin timing cannot change with placement.
 ## (SDRAM_A also drives DQM and dq_oe fans out to 16 pins: those stay in the

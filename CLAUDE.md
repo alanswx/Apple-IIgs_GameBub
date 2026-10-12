@@ -15,6 +15,12 @@ and framework constraints, the block-RAM budget, the reuse list and the phases.
   Vivado 2023.2+; this box has 2025.2 ML Standard, Artix-7 only, in
   `~/vivado`, i.e. `~/vivado/2025.2/Vivado`).
 * `scripts/lint.sh` lints the whole core with Verilator (no Vivado).
+* `sim/run_tb.sh` builds and runs the whole-core testbench
+  (`sim/tb_gamebub.sv`: MCU host model, SDRAM model with real read timing,
+  frame capture). ROMs and disks go in the ignored `scratch/` folder
+  (default ROM: `scratch/roms/boot.rom`); e.g. `sim/run_tb.sh
+  +disk=scratch/roms/game.woz +frames=600 +dump=50 +raw`. About 3 s of wall
+  time per IIgs frame. `scripts/ppm2png.py sim_out/*.ppm` converts frames.
   `python3 scripts/import_iigs.py` re-imports `rtl/iigs/` from upstream.
 * Chisel elaboration alone (prints the `iigs_gamebub` port template, no
   Vivado): `./mill -i --no-build-lock root.runMain platform.handheld.HandheldTop

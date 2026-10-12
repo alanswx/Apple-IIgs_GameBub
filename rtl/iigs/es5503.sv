@@ -34,7 +34,7 @@ module es5503
     output reg [7:0]  data_out,
     output reg [16:0] addr_out,
     output reg [15:0] sound_out,
-    output [3:0]      ca,
+    output reg [3:0]  ca,   // [gamebub] reg for Vivado
     output	      irq,
     output	      osc_en
     );

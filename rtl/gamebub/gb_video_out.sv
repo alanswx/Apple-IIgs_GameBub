@@ -8,7 +8,11 @@
 // INPUT. The VGC runs on clk_vid (28.6 MHz) with ce_pix every other clock, so
 // each pixel is held for exactly one clk_sys (14.3 MHz) period: sampled on
 // clk_sys, every clock is one pixel. HBlank/VBlank bound the 744 x 240 picture
-// including the border; CROP_X/CROP_Y place the 640 x 200 active area in it.
+// including the border; CROP_X/CROP_Y place the 640 x 200 Super Hi-Res area in
+// it: rtl/iigs/vgc.sv draws SHR at H = 44..683 (BL..BR) and lines 19..218
+// (video_timing.sv: top border 19), and the testbench's raw capture puts
+// 40-column text at x = 84.. (BLE), so x = H. Apple II modes (560 x 192) sit
+// inside that window with a little border round them.
 //
 // HALVE = 1 (the default) emits 320 x 200: each pair of pixels is averaged.
 // Super Hi-Res 320 mode, which almost every IIgs game uses, sends every pixel
@@ -24,8 +28,8 @@
 `default_nettype none
 
 module gb_video_out #(
-	parameter integer CROP_X = 52,
-	parameter integer CROP_Y = 20,
+	parameter integer CROP_X = 44,
+	parameter integer CROP_Y = 19,
 	parameter integer ACTIVE_W = 640,
 	parameter integer ACTIVE_H = 200,
 	parameter bit     HALVE  = 1'b1,

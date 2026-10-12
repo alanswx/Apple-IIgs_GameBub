@@ -9,6 +9,8 @@
 //     /6   171.88  MHz  clk_spi      framework MCU SPI sampler (>= 160 MHz)
 //     /36   28.646 MHz  clk_display  LCD dot clock (must stay below ~29.7 MHz,
 //                                    see chisel/src/AppleIIgs.scala)
+//     /5   206.25  MHz  clk_ref      IDELAYCTRL reference (190..210 MHz),
+//                                    for the SDRAM read delays (gb_sdram_idelay)
 //
 // All outputs come from one MMCM through BUFGs, so clk_vid and clk_mem are
 // exact multiples of clk_sys with aligned rising edges, as on MiSTer, and
@@ -24,11 +26,12 @@ module gb_clocks (
 	output wire clk_mem,
 	output wire clk_spi,
 	output wire clk_display,
+	output wire clk_ref,
 	output wire locked
 );
 
 	wire clk_fb;
-	wire clk_sys_u, clk_vid_u, clk_mem_u, clk_spi_u;
+	wire clk_sys_u, clk_vid_u, clk_mem_u, clk_spi_u, clk_ref_u;
 	// Vivado names the MMCM output clock after this net, and the framework's
 	// common.xdc declares a clock called "clk_dpi" physically exclusive with
 	// its HDMI clock (both feed one BUFGMUX). Any other name leaves the two
@@ -45,6 +48,7 @@ module gb_clocks (
 		.CLKOUT2_DIVIDE     (9),
 		.CLKOUT3_DIVIDE     (6),
 		.CLKOUT4_DIVIDE     (36),
+		.CLKOUT5_DIVIDE     (5),
 		.CLKOUT0_PHASE      (0.0),
 		.CLKOUT1_PHASE      (0.0),
 		.CLKOUT2_PHASE      (0.0),
@@ -70,7 +74,7 @@ module gb_clocks (
 		.CLKOUT3  (clk_spi_u),
 		.CLKOUT3B (),
 		.CLKOUT4  (clk_dpi),
-		.CLKOUT5  (),
+		.CLKOUT5  (clk_ref_u),
 		.CLKOUT6  (),
 		.LOCKED   (locked),
 		.PWRDWN   (1'b0),
@@ -82,6 +86,7 @@ module gb_clocks (
 	BUFG bufg_mem     (.I(clk_mem_u), .O(clk_mem));
 	BUFG bufg_spi     (.I(clk_spi_u), .O(clk_spi));
 	BUFG bufg_display (.I(clk_dpi),   .O(clk_display));
+	BUFG bufg_ref     (.I(clk_ref_u), .O(clk_ref));
 
 endmodule
 

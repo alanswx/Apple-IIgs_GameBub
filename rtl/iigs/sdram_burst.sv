@@ -221,7 +221,8 @@ module sdram_burst #(
     always @(posedge clk) begin
         if (state == STATE_START) SDRAM_BA <= (mode == MODE_NORMAL) ? a_bank(cur) : 2'b00;
 
-        dq_oe <= 1'b0;
+        // [gamebub] bus enabled from STATE_START of a write round (see iigs.xdc)
+        dq_oe <= (mode == MODE_NORMAL) && active && we && (state >= STATE_START) && (state < STATE_CONT);
         casex ({active, we, mode, state})
             {2'bXX, MODE_NORMAL, STATE_START}: {SDRAM_nRAS,SDRAM_nCAS,SDRAM_nWE} <= active ? CMD_ACTIVE : CMD_AUTO_REFRESH;
             {2'b11, MODE_NORMAL, STATE_CONT }: begin {SDRAM_nRAS,SDRAM_nCAS,SDRAM_nWE} <= CMD_WRITE; dq_out <= wdata; dq_oe <= 1'b1; end

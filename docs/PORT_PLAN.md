@@ -258,6 +258,32 @@ Decisions that differ from the sections above:
 * Video crop (`CROP_X`/`CROP_Y` in `gb_video_out.sv`) is a guess until the
   phase 3 simulation shows the active area.
 
+### First Vivado build and simulation (2026-10-12)
+
+Vivado 2025.2 builds a bitstream that meets every timing constraint
+(34% LUTs, 124 of 135 block RAMs: phase 4's track-buffer removal is needed
+for headroom). The whole-core testbench (`sim/run_tb.sh`, below) boots
+ROM 3 to its "Apple IIgs / ROM Version 3" screen with every SDRAM read
+checked against the model. What it took:
+
+* **Import patches**: `es5503` declares `ca` as a wire but assigns it in an
+  always block (Vivado rejects it); `sdram_burst` enables the data bus from
+  the start of a write round (one register drives 16 tristates, so it cannot
+  sit in the I/O blocks and missed the chip's write setup by 0.3 ns).
+* **`bram_ce` builds memories deeper than 32K as explicit 32K banks**:
+  Vivado cascaded RAMB36 pairs for the 128K slow RAM and failed DRC
+  REQP-1962 at placement.
+* **SDRAM read capture**: the simulation proved `sdram_burst` samples a beat
+  1.5 clk_mem periods after the chip edge that launched it (with no I/O
+  delay in the model, every read returned the next word). On this board
+  Vivado then showed setup +1.9 / hold -0.7 ns; `gb_sdram_idelay` puts a
+  fixed IDELAYE2 (9 taps, reference 206.25 MHz from the MMCM) on each DQ
+  pin, giving +0.29 / +0.16 ns. `iigs.xdc` documents the constraints. The
+  margin is real but small: if hardware shows read errors, retune `TAPS`
+  (about 76 ps each) first.
+* **Video window**: `vgc.sv` draws Super Hi-Res at H 44..683 and lines
+  19..218 of the 744 x 240 picture, so `CROP_X = 44`, `CROP_Y = 19`.
+
 ## 10. Open questions
 
 * ~~Does a missing optional `dependent_on_0` file get skipped cleanly?~~
