@@ -50,3 +50,6 @@ __pycache__/
 .idea/
 .vscode/
 /.venv/
+
+# macOS AppleDouble files
+._*

@@ -1,0 +1,2280 @@
+//============================================================================
+//  ADB -- Apple Desktop Bus controller (keyboard and mouse)
+//
+//  Copyright (c) Pierre Cornier
+//  Copyright (c) Steven A. Wilson
+//  Copyright (c) Alan Steremberg
+//
+//  This program is free software; you can redistribute it and/or modify it
+//  under the terms of the GNU General Public License as published by the Free
+//  Software Foundation; either version 3 of the License, or (at your option)
+//  any later version.
+//
+//  This program is distributed in the hope that it will be useful, but WITHOUT
+//  ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+//  FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
+//  more details.
+//
+//  You should have received a copy of the GNU General Public License along
+//  with this program. If not, see <https://www.gnu.org/licenses/>.
+//============================================================================
+
+// Define DEBUG_ADB to enable verbose ADB debug output
+//`define DEBUG_ADB
+//`define DEBUG_DESKMGR
+
+module adb(
+  input CLK_14M,
+  input cen,
+  input reset,
+  input cold_reset,           // 1 = cold/power-on reset (wipe keyuc power-up flag)
+  input [7:0] addr,
+  input rw,
+  input [7:0] din,
+  output reg [7:0] dout,
+  output [7:0] dout_comb,  // Combinational output for same-cycle reads
+  output irq,
+  output kbd_srq_irq,      // ADB keyboard Service Request interrupt (Wolf3D-style raw SRQ)
+  input strobe,
+  input [10:0] ps2_key,
+  input [24:0] ps2_mouse,
+  input [8:0] vbl_count,   // VBL counter from video system for key repeat timing
+  output reg CLR80COL,
+  output reg STORE80,
+  output reg RAMRD,
+  output reg RAMWRT,
+  output reg ALTZP,
+  output reg capslock,
+  input selftest_override,
+  output reg open_apple,
+  output reg closed_apple,
+  output reg apple_shift,
+  output reg apple_ctrl,
+  output reg akd,
+  output reg [7:0] K,
+  output reset_key_pressed,  // Reset key (F11/0x7F) is currently pressed
+  input rom_select            // 0=ROM3, 1=ROM1
+);
+
+// Version - determined at runtime by rom_select
+// ROM3 (1MB Apple IIgs) = version 6, ROM1 (256K Apple IIgs) = version 5
+wire [7:0] VERSION = rom_select ? 8'd5 : 8'd6;
+
+// ADB microcontroller ROM (4KB, loaded from file)
+// Always use ROM3 ADB microcontroller ROM (superset of ROM1)
+wire [11:0] adb_rom_addr;
+wire [7:0] adb_rom_data= rom_select ? adb_rom_data_1 : adb_rom_data_3;
+wire [7:0] adb_rom_data_3;
+wire [7:0] adb_rom_data_1;
+reg [11:0] adb_rom_addr_reg;
+
+rom_adb3 adb_rom_inst ( // [gamebub] adb_rom3.hex, generated module
+  .clock(CLK_14M),
+  .ce(1'b1),
+  .address(adb_rom_addr),
+  .q(adb_rom_data_3)
+);
+rom_adb1 adb_rom1_inst ( // [gamebub] adb_rom1.hex, generated module
+  .clock(CLK_14M),
+  .ce(1'b1),
+  .address(adb_rom_addr),
+  .q(adb_rom_data_1)
+);
+
+// ROM address is derived from cmd_data when reading ROM area
+assign adb_rom_addr = {cmd_data[3:0], cmd_data[15:8]};
+
+// State machine states (from working stub)
+parameter
+  IDLE = 3'd0,
+  CMD = 3'd1,
+  DATA = 3'd2,
+  CMD_EXEC = 3'd3;  // Wait state for ROM read latency
+
+reg [2:0] state;
+reg soft_reset;
+
+// Core ADB registers (minimal set from stub)
+reg [7:0] interrupt;
+reg pending_irq;
+reg [2:0] pending_data;
+reg [31:0] data;
+reg [7:0] cmd;
+reg [3:0] cmd_len;
+reg [15:0] cmd_timeout;  // Timeout counter for stuck commands
+reg [63:0] cmd_data;
+reg [3:0] initial_cmd_len;
+reg cmd_response_ready;  // Flag indicating command completed with response
+reg strobe_prev;  // Previous strobe value for edge detection
+reg rw_prev;      // Previous rw value to detect read->write transitions
+reg c024_was_read;  // Track if C024 was read on previous strobe (for falling edge handling)
+reg c026_status_read_with_data;  // Track if C026 status was read with pending data (for IDLE->DATA transition)
+reg deskmgr_read_with_pending;   // Track if C026 status was read while desk-mgr (0x20) pending (clear on strobe falling edge)
+reg data_last_byte_read;  // Flag: last DATA byte was output, waiting for strobe to fall before IDLE
+
+// Device configuration registers
+reg [7:0] adb_mode;
+reg [7:0] kbd_ctl_addr = 8'd2;
+reg [7:0] mouse_ctl_addr = 8'd3;
+reg [7:0] char_set = 8'd0;
+reg [7:0] layout = 8'd0;
+reg [7:0] repeat_info = 8'h23;  // Key repeat configuration: delay[6:4], rate[3:0]
+
+// Interrupt and status flags
+reg data_int, mouse_int, kbd_int;
+reg valid_mouse_data;
+reg valid_kbd;
+reg mouse_coord;
+reg cmd_full;
+
+// Device simulation - 16 possible devices, 4 registers each
+reg [7:0] device_registers [15:0][3:0];  // [device][register]
+reg [15:0] device_present;               // Bit mask of present devices
+reg [7:0] device_data_pending [15:0];    // Pending data count per device
+
+// Keyboard FIFO and management
+parameter MAX_KBD_BUF = 8;
+reg [7:0] kbd_fifo [MAX_KBD_BUF-1:0];    // Keyboard FIFO buffer
+reg [3:0] kbd_fifo_head;                 // FIFO head pointer
+reg [3:0] kbd_fifo_tail;                 // FIFO tail pointer
+reg [3:0] kbd_fifo_count;                // Number of keys in FIFO
+reg kbd_strobe;                          // Keyboard strobe bit
+
+// ADB-side 1-deep staging buffer for Register 0 events. When a press
+// arrives and the host hasn't yet read the previous event
+// (device_data_pending[2] still 1), subsequent press/release events land
+// here and get promoted to device_registers[2][0] as soon as the host
+// drains. Without this, a fast tap (press immediately followed by
+// release, before the test's next TALK R0) would overwrite the press with
+// the release and the diag keyboard test would see an unexpected release
+// and flag "key stuck in down position".
+reg [7:0] kbd_r0_next;
+reg       kbd_r0_next_valid;
+
+// Modifier key tracking for selftest override and keyboard processing
+reg shift_down;           // Bit 0: Shift key down
+reg ctrl_down;            // Bit 1: Control key down
+reg option_down;          // Bit 6: Option key down
+reg cmd_down;             // Bit 7: Command key down
+reg reset_key_down;       // Reset key (F11 mapped to 0x7F) is pressed
+reg selftest_override_prev; // Edge-detect selftest_override to release forced keys
+
+// Reset key output - active when Reset key is pressed
+// The ROM checks for Ctrl+Reset to trigger reset
+assign reset_key_pressed = reset_key_down;
+
+// Key repeat state - GSplus-style approach (repeat on C000 read when strobe clear)
+reg ps2_key_held;                    // A key is currently held down
+reg [8:0] held_ps2_key;              // PS/2 scancode of held key
+reg [7:0] held_iie_char;             // ASCII character for repeat
+reg [15:0] repeat_vbl_target;        // VBL count when next repeat should occur
+reg c010_processed_this_strobe;      // Prevent multiple C010 processing per bus cycle
+reg prev_strobe;                     // For edge detection
+
+// 60Hz timing for repeat
+reg [17:0] clk_60hz_counter;
+reg [15:0] hz60_count;
+localparam CLK_60HZ_PERIOD = 18'd233333; // 14MHz / 60Hz
+
+// Repeat timing configuration (in VBL counts at 60Hz)
+reg [7:0] repeat_delay_vbl;          // Initial delay before repeat starts
+reg [7:0] repeat_rate_vbl;           // Interval between repeats
+
+// IRQ generation
+wire data_irq = data_int & (pending_data > 0);
+wire mouse_irq = mouse_int & valid_mouse_data;
+wire kbd_irq = kbd_int & kbd_strobe;
+assign irq = data_irq | mouse_irq | kbd_irq;
+
+// ADB keyboard Service Request (SRQ) interrupt.
+// Wolfenstein 3D (and similar) disable keyboard autopoll via Set Modes (mode
+// bit 0) and install an _SRQPoll completion routine; they expect raw key
+// up/down events to arrive through ADB service-request interrupts rather than
+// $C000 polling. kbd_srq_pending is set when a key event occurs while keyboard
+// autopoll is OFF, and cleared when the host drains the events via TALK R0.
+// Gating on autopoll-off means normal/boot/Finder operation (autopoll ON) is
+// completely unaffected -> no regression to existing keyboard behavior.
+reg  kbd_srq_pending;
+wire kbd_autopoll_off = adb_mode[0];  // Set Modes bit0 = disable keyboard autopoll
+
+// IIgs Ctrl-OpenApple-Esc -> Desk Manager (Control Panel CDA). On a real IIgs
+// this combo is NOT detected by software reading $C025 — the ADB GLU itself,
+// on Escape key-DOWN while Control+Command are held, sets bit 5 (0x20) of the
+// $C026 status byte and raises the ADB data interrupt. The firmware's ADB IRQ
+// handler reads $C026, sees 0x20, and enters the Desk Manager. (Matches gsplus
+// adb_key_event() and Clemens _clem_adb_glu_keyb_parse().) One-shot: cleared
+// when the firmware reads $C026.
+reg  desk_mgr_pending;
+// ADB IRQ to the CPU while keyboard autopoll is off (Wolfenstein 3D SRQ path):
+//   (a) kbd_srq_pending  — a key transition is waiting (cleared by TALK R0), and
+//   (b) data_int & pending_data>0 — a TALK-R0 RESPONSE is waiting to be read.
+// (b) is the ADB "data" interrupt (data_irq, line ~160) which was computed but
+// never wired to cpu_irq, so the 2-byte keyboard response the firmware requests
+// via TALK R0 had nothing to prompt the firmware to read it -> the key never
+// reached the game and held keys didn't move. It self-clears when the firmware
+// reads the response (pending_data -> 0) and is gated on data_int (the firmware's
+// own enable) + autopoll-off, so it cannot fire during GS/OS boot or autopoll-on
+// use (regression-safe) and only after the firmware itself issues the TALK
+// (so it can't storm on a stale key-press at game load like the reverted
+// device_data_pending level-signal did).
+assign kbd_srq_irq = kbd_srq_pending |
+                     (kbd_autopoll_off & data_int & (pending_data > 3'd0)) |
+                     // Ctrl-OA-Esc Desk Manager interrupt (autopoll-on desktop):
+                     // gated on data_int ($C027 DATA_INT enable) exactly like the
+                     // gsplus adb_add_data_int() path. Self-clears on $C026 read.
+                     (desk_mgr_pending & data_int);
+
+// ADB controller internal RAM using bram module
+reg [7:0] ram_addr;
+reg [7:0] ram_din;
+wire [7:0] ram_dout;
+reg ram_wen;
+
+// READ address is combinational (mirrors adb_rom_addr) so the registered BRAM
+// output ram_dout is valid when CMD_EXEC captures it -- the same one-cycle
+// settle the CMD->CMD_EXEC step gives the ROM. A registered ram_addr would make
+// q_a lag one cycle, so a READ_MEM right after reset (ram_addr==0) returned
+// mem[0] instead of the requested cell. That made ROM1's power-up check read
+// keyuc $51 as $00 and cold-boot on every warm reset. WRITEs still use the
+// registered ram_addr (set with ram_din/ram_wen together in the $08 handler).
+wire [7:0] ram_addr_eff = ram_wen ? ram_addr : cmd_data[15:8];
+
+bram #(
+    .width_a(8),
+    .widthad_a(8)
+) adb_ram (
+    .clock_a(CLK_14M),
+    .wren_a(ram_wen),
+    .address_a(ram_addr_eff),
+    .data_a(ram_din),
+    .q_a(ram_dout),
+
+    // Port B unused
+    .clock_b(CLK_14M),
+    .wren_b(1'b0),
+    .address_b(8'h00),
+    .data_b(8'h00),
+    .q_b()
+);
+
+// Apple IIe compatibility registers
+reg [7:0] c025;
+
+// PS/2 input handling - track toggle bits for edge detection
+reg ps2_key_toggle_prev, ps2_mouse_toggle_prev;
+
+// Modifier key states (moved up above with other regs)
+reg caps_lock_state;
+
+// PS/2 to Apple IIgs keyboard translation function
+function [7:0] ps2_to_apple_key;
+  input [8:0] ps2_scancode;  // ps2_key[8:0] - includes extended bit
+  begin
+    case(ps2_scancode) // PS/2 Scan Code Set 2 to Apple IIgs translation
+      9'h000: ps2_to_apple_key = 8'h7F;  // Invalid
+      9'h001: ps2_to_apple_key = 8'h65;  // F9
+      9'h002: ps2_to_apple_key = 8'h7F;  // Invalid
+      9'h003: ps2_to_apple_key = 8'h60;  // F5
+      9'h004: ps2_to_apple_key = 8'h63;  // F3
+      9'h005: ps2_to_apple_key = 8'h7A;  // F1
+      9'h006: ps2_to_apple_key = 8'h78;  // F2
+      9'h007: ps2_to_apple_key = 8'h7F;  // F12 (unmapped)
+      9'h008: ps2_to_apple_key = 8'h7F;  // Invalid
+      9'h009: ps2_to_apple_key = 8'h6D;  // F10
+      9'h00a: ps2_to_apple_key = 8'h64;  // F8
+      9'h00b: ps2_to_apple_key = 8'h61;  // F6
+      9'h00c: ps2_to_apple_key = 8'h76;  // F4
+      9'h00d: ps2_to_apple_key = 8'h30;  // TAB
+      9'h00e: ps2_to_apple_key = 8'h32;  // ~ (`)
+      9'h00f: ps2_to_apple_key = 8'h7F;  // Invalid
+      9'h010: ps2_to_apple_key = 8'h7F;  // Invalid
+      9'h011: ps2_to_apple_key = 8'h37;  // LEFT ALT (command)
+      9'h012: ps2_to_apple_key = 8'h38;  // LEFT SHIFT
+      9'h013: ps2_to_apple_key = 8'h7F;  // Invalid
+      9'h014: ps2_to_apple_key = 8'h36;  // CTRL
+      9'h015: ps2_to_apple_key = 8'h0C;  // Q
+      9'h016: ps2_to_apple_key = 8'h12;  // 1
+      9'h017: ps2_to_apple_key = 8'h7F;  // Invalid
+      9'h018: ps2_to_apple_key = 8'h7F;  // Invalid
+      9'h019: ps2_to_apple_key = 8'h7F;  // Invalid
+      9'h01a: ps2_to_apple_key = 8'h06;  // Z
+      9'h01b: ps2_to_apple_key = 8'h01;  // S
+      9'h01c: ps2_to_apple_key = 8'h00;  // A
+      9'h01d: ps2_to_apple_key = 8'h0D;  // W
+      9'h01e: ps2_to_apple_key = 8'h13;  // 2
+      9'h01f: ps2_to_apple_key = 8'h7F;  // Invalid
+      9'h020: ps2_to_apple_key = 8'h7F;  // Invalid
+      9'h021: ps2_to_apple_key = 8'h08;  // C
+      9'h022: ps2_to_apple_key = 8'h07;  // X
+      9'h023: ps2_to_apple_key = 8'h02;  // D
+      9'h024: ps2_to_apple_key = 8'h0E;  // E
+      9'h025: ps2_to_apple_key = 8'h15;  // 4
+      9'h026: ps2_to_apple_key = 8'h14;  // 3
+      9'h027: ps2_to_apple_key = 8'h7F;  // Invalid
+      9'h028: ps2_to_apple_key = 8'h7F;  // Invalid
+      9'h029: ps2_to_apple_key = 8'h31;  // SPACE
+      9'h02a: ps2_to_apple_key = 8'h09;  // V
+      9'h02b: ps2_to_apple_key = 8'h03;  // F
+      9'h02c: ps2_to_apple_key = 8'h11;  // T
+      9'h02d: ps2_to_apple_key = 8'h0F;  // R
+      9'h02e: ps2_to_apple_key = 8'h17;  // 5
+      9'h02f: ps2_to_apple_key = 8'h7F;  // Invalid
+      9'h030: ps2_to_apple_key = 8'h7F;  // Invalid
+      9'h031: ps2_to_apple_key = 8'h2D;  // N
+      9'h032: ps2_to_apple_key = 8'h0B;  // B
+      9'h033: ps2_to_apple_key = 8'h04;  // H
+      9'h034: ps2_to_apple_key = 8'h05;  // G
+      9'h035: ps2_to_apple_key = 8'h10;  // Y
+      9'h036: ps2_to_apple_key = 8'h16;  // 6
+      9'h037: ps2_to_apple_key = 8'h7F;  // Invalid
+      9'h038: ps2_to_apple_key = 8'h7F;  // Invalid
+      9'h039: ps2_to_apple_key = 8'h7F;  // Invalid
+      9'h03a: ps2_to_apple_key = 8'h2E;  // M
+      9'h03b: ps2_to_apple_key = 8'h26;  // J
+      9'h03c: ps2_to_apple_key = 8'h20;  // U
+      9'h03d: ps2_to_apple_key = 8'h1A;  // 7
+      9'h03e: ps2_to_apple_key = 8'h1C;  // 8
+      9'h03f: ps2_to_apple_key = 8'h7F;  // Invalid
+      9'h040: ps2_to_apple_key = 8'h7F;  // Invalid
+      9'h041: ps2_to_apple_key = 8'h2B;  // < (,)
+      9'h042: ps2_to_apple_key = 8'h28;  // K
+      9'h043: ps2_to_apple_key = 8'h22;  // I
+      9'h044: ps2_to_apple_key = 8'h1F;  // O
+      9'h045: ps2_to_apple_key = 8'h1D;  // 0
+      9'h046: ps2_to_apple_key = 8'h19;  // 9
+      9'h047: ps2_to_apple_key = 8'h7F;  // Invalid
+      9'h048: ps2_to_apple_key = 8'h7F;  // Invalid
+      9'h049: ps2_to_apple_key = 8'h2F;  // > (.)
+      9'h04a: ps2_to_apple_key = 8'h2C;  // FORWARD SLASH
+      9'h04b: ps2_to_apple_key = 8'h25;  // L
+      9'h04c: ps2_to_apple_key = 8'h29;  // ;
+      9'h04d: ps2_to_apple_key = 8'h23;  // P
+      9'h04e: ps2_to_apple_key = 8'h1B;  // - (minus)
+      9'h04f: ps2_to_apple_key = 8'h7F;  // Invalid
+      9'h050: ps2_to_apple_key = 8'h7F;  // Invalid
+      9'h051: ps2_to_apple_key = 8'h7F;  // Invalid
+      9'h052: ps2_to_apple_key = 8'h27;  // ' ("")
+      9'h053: ps2_to_apple_key = 8'h7F;  // Invalid
+      9'h054: ps2_to_apple_key = 8'h21;  // [
+      9'h055: ps2_to_apple_key = 8'h18;  // = 
+      9'h056: ps2_to_apple_key = 8'h7F;  // Invalid
+      9'h057: ps2_to_apple_key = 8'h7F;  // Invalid
+      9'h058: ps2_to_apple_key = 8'h39;  // CAPSLOCK
+      9'h059: ps2_to_apple_key = 8'h7B;  // RIGHT SHIFT
+      9'h05a: ps2_to_apple_key = 8'h24;  // ENTER
+      9'h05b: ps2_to_apple_key = 8'h1E;  // ]
+      9'h05c: ps2_to_apple_key = 8'h7F;  // Invalid
+      9'h05d: ps2_to_apple_key = 8'h2A;  // BACKSLASH
+      9'h05e: ps2_to_apple_key = 8'h7F;  // Invalid
+      9'h05f: ps2_to_apple_key = 8'h7F;  // Invalid
+      9'h060: ps2_to_apple_key = 8'h7F;  // Invalid
+      9'h061: ps2_to_apple_key = 8'h7F;  // International left shift (German <> key)
+      9'h062: ps2_to_apple_key = 8'h7F;  // Invalid
+      9'h063: ps2_to_apple_key = 8'h7F;  // Invalid
+      9'h064: ps2_to_apple_key = 8'h7F;  // Invalid
+      9'h065: ps2_to_apple_key = 8'h7F;  // Invalid
+      9'h066: ps2_to_apple_key = 8'h33;  // BACKSPACE
+      9'h067: ps2_to_apple_key = 8'h7F;  // Invalid
+      9'h068: ps2_to_apple_key = 8'h7F;  // Invalid
+      9'h069: ps2_to_apple_key = 8'h53;  // KP 1
+      9'h06a: ps2_to_apple_key = 8'h7F;  // Invalid
+      9'h06b: ps2_to_apple_key = 8'h56;  // KP 4
+      9'h06c: ps2_to_apple_key = 8'h59;  // KP 7
+      9'h06d: ps2_to_apple_key = 8'h7F;  // Invalid
+      9'h06e: ps2_to_apple_key = 8'h7F;  // Invalid
+      9'h06f: ps2_to_apple_key = 8'h7F;  // Invalid
+      9'h070: ps2_to_apple_key = 8'h52;  // KP 0
+      9'h071: ps2_to_apple_key = 8'h41;  // KP .
+      9'h072: ps2_to_apple_key = 8'h54;  // KP 2
+      9'h073: ps2_to_apple_key = 8'h57;  // KP 5
+      9'h074: ps2_to_apple_key = 8'h58;  // KP 6
+      9'h075: ps2_to_apple_key = 8'h5B;  // KP 8
+      9'h076: ps2_to_apple_key = 8'h35;  // ESCAPE
+      9'h077: ps2_to_apple_key = 8'h47;  // NUMLOCK (Mac keypad clear)
+      9'h078: ps2_to_apple_key = 8'h7F;  // F11 -> Apple Reset key (was 0x67/F11)
+      9'h079: ps2_to_apple_key = 8'h45;  // KP +
+      9'h07a: ps2_to_apple_key = 8'h55;  // KP 3
+      9'h07b: ps2_to_apple_key = 8'h4E;  // KP -
+      9'h07c: ps2_to_apple_key = 8'h43;  // KP *
+      9'h07d: ps2_to_apple_key = 8'h5C;  // KP 9
+      9'h07e: ps2_to_apple_key = 8'h7F;  // SCROLL LOCK
+      9'h07f: ps2_to_apple_key = 8'h7F;  // Invalid
+      9'h080: ps2_to_apple_key = 8'h7F;  // Invalid
+      9'h081: ps2_to_apple_key = 8'h7F;  // Invalid
+      9'h082: ps2_to_apple_key = 8'h7F;  // Invalid
+      9'h083: ps2_to_apple_key = 8'h62;  // F7
+      9'h084: ps2_to_apple_key = 8'h7F;  // Invalid
+      // Extended keys (ps2_key[8] = 1) - these require special handling
+      9'h111: ps2_to_apple_key = 8'h37;  // RIGHT ALT (command)
+      9'h114: ps2_to_apple_key = 8'h36;  // RIGHT CTRL (extended ctrl)
+      9'h11f: ps2_to_apple_key = 8'h3A;  // WINDOWS/APPLICATION KEY (option)
+      9'h127: ps2_to_apple_key = 8'h3A;  // MENU KEY (option)
+      9'h14a: ps2_to_apple_key = 8'h4B;  // KP /
+      9'h15a: ps2_to_apple_key = 8'h4C;  // KP ENTER
+      9'h169: ps2_to_apple_key = 8'h77;  // END
+      9'h16b: ps2_to_apple_key = 8'h3B;  // ARROW LEFT
+      9'h16c: ps2_to_apple_key = 8'h73;  // HOME
+      9'h170: ps2_to_apple_key = 8'h72;  // INSERT (HELP)
+      9'h171: ps2_to_apple_key = 8'h75;  // DELETE
+      9'h172: ps2_to_apple_key = 8'h3D;  // ARROW DOWN
+      9'h174: ps2_to_apple_key = 8'h3C;  // ARROW RIGHT
+      9'h175: ps2_to_apple_key = 8'h3E;  // ARROW UP
+      9'h17a: ps2_to_apple_key = 8'h79;  // PGDN
+      9'h17c: ps2_to_apple_key = 8'h69;  // PRTSCR (F13)
+      9'h17d: ps2_to_apple_key = 8'h74;  // PGUP
+      9'h17e: ps2_to_apple_key = 8'h71;  // CTRL+BREAK (F15)
+      default: ps2_to_apple_key = 8'h7F;  // Unmapped keys
+    endcase
+  end
+endfunction
+
+// Key repeat timing calculation functions
+
+function is_fast_repeat_key;
+  input [7:0] key_code;  // Apple ADB key code
+  begin
+    // Fast repeat keys: arrows (0x3B-0x3E), space (0x31), delete (0x33)
+    is_fast_repeat_key = (key_code == 8'h31) ||  // Space
+                        (key_code == 8'h33) ||   // Delete  
+                        (key_code >= 8'h3B && key_code <= 8'h3E); // Arrow keys
+  end
+endfunction
+
+function is_repeatable_key;
+  input [7:0] key_code;  // Apple ADB key code
+  begin
+    // Repeatable keys are ASCII keys (not modifiers / locks)
+    is_repeatable_key = (key_code != 8'h36) &&   // Control
+                       (key_code != 8'h37) &&    // Command
+                       (key_code != 8'h38) &&    // Left Shift
+                       (key_code != 8'h39) &&    // Caps Lock (state toggle, not repeat)
+                       (key_code != 8'h3A) &&    // Option
+                       (key_code != 8'h7B) &&    // Right Shift
+                       (key_code != 8'h7F);      // Invalid
+  end
+endfunction
+
+
+// Apple IIe ASCII conversion function 
+function [7:0] adb_to_apple_iie_ascii;
+  input [6:0] adb_key;     // ADB key code (0x00-0x7F)
+  input       shift_mod;   // Shift modifier active
+  input       ctrl_mod;    // Control modifier active  
+  input       caps_mod;    // Caps lock active
+  
+  reg [7:0] normal_ascii;
+  reg [7:0] shift_ascii;
+  reg [7:0] ctrl_ascii;
+  reg       is_letter;
+  
+  begin
+    // Default values
+    normal_ascii = 8'hFF;
+    shift_ascii = 8'hFF;
+    ctrl_ascii = 8'hFF;
+    is_letter = 1'b0;
+    
+    // Basic character mappings
+    case(adb_key)
+      // Letters
+      7'h00: begin normal_ascii = "a"; shift_ascii = "A"; ctrl_ascii = 8'h01; is_letter = 1'b1; end // A
+      7'h01: begin normal_ascii = "s"; shift_ascii = "S"; ctrl_ascii = 8'h13; is_letter = 1'b1; end // S
+      7'h02: begin normal_ascii = "d"; shift_ascii = "D"; ctrl_ascii = 8'h04; is_letter = 1'b1; end // D
+      7'h03: begin normal_ascii = "f"; shift_ascii = "F"; ctrl_ascii = 8'h06; is_letter = 1'b1; end // F
+      7'h04: begin normal_ascii = "h"; shift_ascii = "H"; ctrl_ascii = 8'h08; is_letter = 1'b1; end // H
+      7'h05: begin normal_ascii = "g"; shift_ascii = "G"; ctrl_ascii = 8'h07; is_letter = 1'b1; end // G
+      7'h06: begin normal_ascii = "z"; shift_ascii = "Z"; ctrl_ascii = 8'h1A; is_letter = 1'b1; end // Z
+      7'h07: begin normal_ascii = "x"; shift_ascii = "X"; ctrl_ascii = 8'h18; is_letter = 1'b1; end // X
+      7'h08: begin normal_ascii = "c"; shift_ascii = "C"; ctrl_ascii = 8'h03; is_letter = 1'b1; end // C
+      7'h09: begin normal_ascii = "v"; shift_ascii = "V"; ctrl_ascii = 8'h16; is_letter = 1'b1; end // V
+      7'h0B: begin normal_ascii = "b"; shift_ascii = "B"; ctrl_ascii = 8'h02; is_letter = 1'b1; end // B
+      7'h0C: begin normal_ascii = "q"; shift_ascii = "Q"; ctrl_ascii = 8'h11; is_letter = 1'b1; end // Q
+      7'h0D: begin normal_ascii = "w"; shift_ascii = "W"; ctrl_ascii = 8'h17; is_letter = 1'b1; end // W
+      7'h0E: begin normal_ascii = "e"; shift_ascii = "E"; ctrl_ascii = 8'h05; is_letter = 1'b1; end // E
+      7'h0F: begin normal_ascii = "r"; shift_ascii = "R"; ctrl_ascii = 8'h12; is_letter = 1'b1; end // R
+      7'h10: begin normal_ascii = "y"; shift_ascii = "Y"; ctrl_ascii = 8'h19; is_letter = 1'b1; end // Y
+      7'h11: begin normal_ascii = "t"; shift_ascii = "T"; ctrl_ascii = 8'h14; is_letter = 1'b1; end // T
+      7'h1F: begin normal_ascii = "o"; shift_ascii = "O"; ctrl_ascii = 8'h0F; is_letter = 1'b1; end // O
+      7'h20: begin normal_ascii = "u"; shift_ascii = "U"; ctrl_ascii = 8'h15; is_letter = 1'b1; end // U
+      7'h22: begin normal_ascii = "i"; shift_ascii = "I"; ctrl_ascii = 8'h09; is_letter = 1'b1; end // I
+      7'h23: begin normal_ascii = "p"; shift_ascii = "P"; ctrl_ascii = 8'h10; is_letter = 1'b1; end // P
+      7'h25: begin normal_ascii = "l"; shift_ascii = "L"; ctrl_ascii = 8'h0C; is_letter = 1'b1; end // L
+      7'h26: begin normal_ascii = "j"; shift_ascii = "J"; ctrl_ascii = 8'h0A; is_letter = 1'b1; end // J
+      7'h28: begin normal_ascii = "k"; shift_ascii = "K"; ctrl_ascii = 8'h0B; is_letter = 1'b1; end // K
+      7'h2D: begin normal_ascii = "n"; shift_ascii = "N"; ctrl_ascii = 8'h0E; is_letter = 1'b1; end // N
+      7'h2E: begin normal_ascii = "m"; shift_ascii = "M"; ctrl_ascii = 8'h0D; is_letter = 1'b1; end // M
+      
+      // Numbers
+      7'h12: begin normal_ascii = "1"; shift_ascii = "!"; ctrl_ascii = 8'hFF; end // 1
+      7'h13: begin normal_ascii = "2"; shift_ascii = "@"; ctrl_ascii = 8'h00; end // 2  
+      7'h14: begin normal_ascii = "3"; shift_ascii = "#"; ctrl_ascii = 8'hFF; end // 3
+      7'h15: begin normal_ascii = "4"; shift_ascii = "$"; ctrl_ascii = 8'hFF; end // 4
+      7'h17: begin normal_ascii = "5"; shift_ascii = "%"; ctrl_ascii = 8'hFF; end // 5
+      7'h16: begin normal_ascii = "6"; shift_ascii = "^"; ctrl_ascii = 8'h1E; end // 6
+      7'h1A: begin normal_ascii = "7"; shift_ascii = "&"; ctrl_ascii = 8'hFF; end // 7
+      7'h1C: begin normal_ascii = "8"; shift_ascii = "*"; ctrl_ascii = 8'hFF; end // 8
+      7'h19: begin normal_ascii = "9"; shift_ascii = "("; ctrl_ascii = 8'hFF; end // 9
+      7'h1D: begin normal_ascii = "0"; shift_ascii = ")"; ctrl_ascii = 8'hFF; end // 0
+      
+      // Special keys
+      7'h35: begin normal_ascii = 8'h1B; shift_ascii = 8'h1B; ctrl_ascii = 8'hFF; end // ESC
+      7'h30: begin normal_ascii = 8'h09; shift_ascii = 8'h09; ctrl_ascii = 8'hFF; end // TAB
+      7'h31: begin normal_ascii = 8'h20; shift_ascii = 8'h20; ctrl_ascii = 8'hFF; end // SPACE
+      7'h24: begin normal_ascii = 8'h0D; shift_ascii = 8'h0D; ctrl_ascii = 8'hFF; end // RETURN
+      7'h33: begin normal_ascii = 8'h7F; shift_ascii = 8'h7F; ctrl_ascii = 8'hFF; end // DELETE
+      
+      // Punctuation
+      7'h29: begin normal_ascii = ";"; shift_ascii = ":"; ctrl_ascii = 8'hFF; end // ;
+      7'h27: begin normal_ascii = "'"; shift_ascii = "\""; ctrl_ascii = 8'hFF; end // '
+      7'h21: begin normal_ascii = "["; shift_ascii = "{"; ctrl_ascii = 8'h1B; end // [
+      7'h1E: begin normal_ascii = "]"; shift_ascii = "}"; ctrl_ascii = 8'h1D; end // ]
+      7'h2A: begin normal_ascii = 8'h5C; shift_ascii = "|"; ctrl_ascii = 8'h1C; end // \
+      7'h2B: begin normal_ascii = ","; shift_ascii = "<"; ctrl_ascii = 8'hFF; end // ,
+      7'h2F: begin normal_ascii = "."; shift_ascii = ">"; ctrl_ascii = 8'hFF; end // .
+      7'h2C: begin normal_ascii = "/"; shift_ascii = "?"; ctrl_ascii = 8'h7F; end // /
+      7'h32: begin normal_ascii = "`"; shift_ascii = "~"; ctrl_ascii = 8'hFF; end // `
+      7'h1B: begin normal_ascii = "-"; shift_ascii = "_"; ctrl_ascii = 8'h1F; end // -
+      7'h18: begin normal_ascii = "="; shift_ascii = "+"; ctrl_ascii = 8'hFF; end // =
+      
+      // Arrow keys
+      7'h3B: begin normal_ascii = 8'h08; shift_ascii = 8'h08; ctrl_ascii = 8'hFF; end // LEFT
+      7'h3C: begin normal_ascii = 8'h15; shift_ascii = 8'h15; ctrl_ascii = 8'hFF; end // RIGHT  
+      7'h3D: begin normal_ascii = 8'h0A; shift_ascii = 8'h0A; ctrl_ascii = 8'hFF; end // DOWN
+      7'h3E: begin normal_ascii = 8'h0B; shift_ascii = 8'h0B; ctrl_ascii = 8'hFF; end // UP
+      
+      default: begin 
+        normal_ascii = 8'hFF; 
+        shift_ascii = 8'hFF; 
+        ctrl_ascii = 8'hFF; 
+      end
+    endcase
+    
+    // Apply modifier logic
+    if (ctrl_mod && ctrl_ascii != 8'hFF) begin
+      adb_to_apple_iie_ascii = ctrl_ascii;
+    end else if (caps_mod && is_letter && normal_ascii >= "a" && normal_ascii <= "z") begin
+      adb_to_apple_iie_ascii = shift_ascii;  // Caps lock = uppercase
+    end else if (shift_mod) begin
+      adb_to_apple_iie_ascii = (shift_ascii != 8'hFF) ? shift_ascii : normal_ascii;
+    end else begin
+      adb_to_apple_iie_ascii = normal_ascii;
+    end
+  end
+endfunction
+
+// VBL-based timing conversion functions (matching GSplus exactly)
+function [7:0] delay_to_vbl_count;
+  input [2:0] delay_setting;  // ADB delay setting (0-7)
+  begin
+    // GSplus: if(tmp1 == 4) g_adb_repeat_delay = 0; else g_adb_repeat_delay = (tmp1 + 1) * 15;
+    case (delay_setting)
+      3'd0: delay_to_vbl_count = 8'd15;  // (0+1)*15 = 15 VBL
+      3'd1: delay_to_vbl_count = 8'd30;  // (1+1)*15 = 30 VBL  
+      3'd2: delay_to_vbl_count = 8'd45;  // (2+1)*15 = 45 VBL
+      3'd3: delay_to_vbl_count = 8'd60;  // (3+1)*15 = 60 VBL
+      3'd4: delay_to_vbl_count = 8'd0;   // No repeat (GSplus: tmp1 == 4)
+      default: delay_to_vbl_count = 8'd45; // Default to 45 VBL for invalid values
+    endcase
+  end
+endfunction
+
+function [7:0] rate_to_vbl_count;
+  input [3:0] rate_setting;    // ADB rate setting (0-9)
+  input       fast_repeat;     // Fast repeat enabled for this key  
+  reg [7:0] base_rate;
+  reg [3:0] tmp1;
+  begin
+    // GSplus logic: if(g_rom_version >= 3) tmp1 = 9 - tmp1; (assume ROM3)
+    tmp1 = 4'd9 - rate_setting;
+    
+    // GSplus rate conversion
+    case (tmp1)
+      4'd0: base_rate = 8'd1;    // GSplus: g_adb_repeat_rate = 1
+      4'd1: base_rate = 8'd2;    // GSplus: g_adb_repeat_rate = 2  
+      4'd2: base_rate = 8'd3;    // GSplus: g_adb_repeat_rate = 3
+      4'd3: base_rate = 8'd3;    // GSplus: g_adb_repeat_rate = 3
+      4'd4: base_rate = 8'd4;    // GSplus: g_adb_repeat_rate = 4
+      4'd5: base_rate = 8'd5;    // GSplus: g_adb_repeat_rate = 5
+      4'd6: base_rate = 8'd7;    // GSplus: g_adb_repeat_rate = 7
+      4'd7: base_rate = 8'd15;   // GSplus: g_adb_repeat_rate = 15
+      4'd8: base_rate = 8'd30;   // GSplus: g_adb_repeat_rate = 30 (ROM3)
+      4'd9: base_rate = 8'd60;   // GSplus: g_adb_repeat_rate = 60 (ROM3)
+      default: base_rate = 8'd3; // Default to 3 VBL
+    endcase
+    
+    // Apply fast repeat (GSplus doesn't seem to implement this in the rates)
+    // Keep simple for now - fast repeat handled elsewhere in GSplus
+    rate_to_vbl_count = base_rate;
+  end
+endfunction
+
+// Combinational output for same-cycle reads (bypasses registered dout)
+// This is needed because the CPU reads data in the same cycle as the address is presented
+reg [7:0] dout_comb_reg;
+assign dout_comb = dout_comb_reg;
+
+always @(*) begin
+  // Default to registered dout
+  dout_comb_reg = dout;
+
+  // Override for specific addresses that need combinational response
+  case (addr)
+    8'h24: begin  // $C024 - Mouse Data
+      if (rw) begin
+        if (valid_mouse_data) begin
+          if (mouse_coord)
+            dout_comb_reg = device_registers[3][0];  // Y + button
+          else
+            dout_comb_reg = device_registers[3][1];  // X + always-1-bit
+        end else begin
+          // No new data - return appropriate "no movement" value
+          if (mouse_coord)
+            dout_comb_reg = {device_registers[3][0][7], 7'b0000000};  // Y: last button state, no delta
+          else
+            dout_comb_reg = 8'h80;  // X: bit7 always 1, no delta
+        end
+      end
+    end
+    8'h25: begin  // $C025 - Modifier Key Register
+      // Must be combinational: the registered `dout` default (above) can hold a
+      // stale value from a prior ADB read. The ROM's Ctrl-OA-Esc handler reads
+      // $C025 (FF:BE8E) immediately AFTER the $C026 desk-mgr read, so the stale
+      // dout still held 0x20 -> bit0 (shift) read as 0 and Ctrl-OA-SHIFT-Esc fell
+      // through to the Desk Accessories menu instead of the direct Control Panel.
+      if (rw)
+        dout_comb_reg = {cmd_down, option_down, 1'b0, 1'b0, c025[3], caps_lock_state, ctrl_down, shift_down};
+    end
+    8'h27: begin  // $C027 - ADB Status
+      if (rw) begin
+        dout_comb_reg = {
+          valid_mouse_data,                        // bit 7: mouse data valid ONLY (see $C027 reg path)
+          mouse_int,                               // bit 6: mouse interrupt enable
+          (pending_data > 0) | kbd_srq_pending | desk_mgr_pending,  // bit 5: data valid (cmd response, SRQ byte, or Ctrl-OA-Esc desk-mgr)
+          data_int,                                // bit 4: data interrupt enable
+          valid_kbd,                               // bit 3: keyboard data valid
+          kbd_int,                                 // bit 2: keyboard interrupt enable
+          mouse_coord,                             // bit 1: mouse coordinate flag
+          cmd_full                                 // bit 0: command full
+        };
+      end
+    end
+    8'h26: begin  // $C026 - ADB Command/Data
+      if (rw) begin
+        case (state)
+          IDLE: begin
+            if (cmd_response_ready) begin
+              if (pending_data > 3'd0)
+                dout_comb_reg = 8'h80 | {5'd0, pending_data - 3'd1};
+              else
+                dout_comb_reg = 8'h80;
+            end else begin
+              dout_comb_reg = (kbd_srq_pending ? 8'h08 : 8'h00) | (pending_irq ? 8'h10 : 8'h00) | (desk_mgr_pending ? 8'h20 : 8'h00);
+            end
+          end
+          DATA: dout_comb_reg = data[7:0];
+          default: dout_comb_reg = dout;
+        endcase
+`ifdef DEBUG_VERBOSE
+        if (strobe && cmd_response_ready)
+          $display("ADB C026_COMB: state=%0d rw=%d cmd_ready=%d pending=%d data[7:0]=%02h -> comb=%02h",
+                   state, rw, cmd_response_ready, pending_data, data[7:0], dout_comb_reg);
+`endif
+      end
+    end
+    8'h00: begin  // $C000 - Keyboard data
+      if (rw) begin
+        dout_comb_reg = K;
+      end
+    end
+    default: begin
+      // Use registered dout for other addresses
+      dout_comb_reg = dout;
+    end
+  endcase
+end
+
+always @(posedge CLK_14M) begin
+
+  // Reset handling
+  if (reset | soft_reset) begin
+    soft_reset <= 1'b0;
+    data_int <= 1'b1;
+    mouse_int <= 1'b0;
+    kbd_int <= 1'b0;
+    state <= IDLE;
+    pending_data <= 3'd0;
+    pending_irq <= 1'b0;
+    cmd_full <= 1'b0;
+    cmd_timeout <= 16'd0;
+    valid_mouse_data <= 1'b0;
+    valid_kbd <= 1'b0;
+    mouse_coord <= 1'b0;
+    cmd_response_ready <= 1'b0;
+    strobe_prev <= 1'b0;
+    rw_prev <= 1'b1;  // Initialize to read (high) so first write is detected
+    c024_was_read <= 1'b0;
+    c026_status_read_with_data <= 1'b0;
+    deskmgr_read_with_pending <= 1'b0;
+    data_last_byte_read <= 1'b0;
+
+    // Initialize command processing registers
+    cmd <= 8'd0;
+    cmd_len <= 4'd0;
+    cmd_data <= 64'd0;
+    initial_cmd_len <= 4'd0;
+
+    // Initialize repeat timing registers
+
+    // Initialize Apple IIe compatibility register
+    c025 <= 8'd0;
+
+    // Initialize output register
+    dout <= 8'd0;
+
+    // Initialize data register with ADB ready status (GSplus-style)
+    // Set bit 3 (0x08) = SRQ flag to indicate ADB controller is ready
+    data <= 32'h00000008;  // SRQ bit set, indicating ADB ready for keyboard operations
+    
+    // Initialize device addresses
+    kbd_ctl_addr <= 8'd2;
+    mouse_ctl_addr <= 8'd3;
+    adb_mode <= 8'd0;
+    repeat_info <= 8'h23;
+    char_set <= 8'd0;
+    layout <= 8'd0;
+    
+    // Keyuc (ADB micro) RAM control during reset. On a COLD/power-on reset,
+    // wipe the power-up flag at $51 ($A5) so ROM1's power-up check sees a fresh
+    // machine and does a full cold boot. On a WARM reset (Ctrl-F11) the flag is
+    // PRESERVED -- the real ADB micro keeps power across a Ctrl-Reset -- so ROM1
+    // reads $A5 and warm-boots. (Paired with the READ_MEM 1-cycle latency fix;
+    // without both, ROM1 always cold-boots on every reset.) ROM3 ignores this
+    // and uses CYAREG bit 6 instead, so it is unaffected either way.
+    if (cold_reset) begin
+      ram_addr <= 8'h51;
+      ram_din  <= 8'h00;
+      ram_wen  <= 1'b1;
+    end else begin
+      ram_wen  <= 1'b0;
+      ram_addr <= 8'h00;
+      ram_din  <= 8'h00;
+    end
+    
+    // PS/2 input tracking
+    ps2_key_toggle_prev <= 1'b0;
+    ps2_mouse_toggle_prev <= 1'b0;
+    
+    // Modifier key states
+    shift_down <= 1'b0;
+    ctrl_down <= 1'b0;
+    cmd_down <= 1'b0;
+    option_down <= 1'b0;
+    caps_lock_state <= 1'b0;
+    reset_key_down <= 1'b0;
+    selftest_override_prev <= 1'b0;
+
+    // Apple IIe compatibility
+    CLR80COL <= 1'b0;
+    STORE80 <= 1'b0;
+    RAMRD <= 1'b0;
+    RAMWRT <= 1'b0;
+    ALTZP <= 1'b0;
+    
+    // Keyboard status outputs
+    capslock <= 1'b0;
+    open_apple <= 1'b0;
+    closed_apple <= 1'b0;
+    apple_shift <= 1'b0;
+    apple_ctrl <= 1'b0;
+    akd <= 1'b0;
+    K <= 8'd0;
+    kbd_strobe <= 1'b0;
+    
+    // Initialize ADB devices
+    device_present <= 16'b0000_0000_0000_1100;  // Devices 2 (kbd) and 3 (mouse) present
+    for (int i = 0; i < 16; i++) begin
+      device_data_pending[i] <= 8'h00;
+      for (int j = 0; j < 4; j++) begin
+        device_registers[i][j] <= 8'h00;
+      end
+    end
+    
+    // Set up keyboard device (address 2) default registers
+    device_registers[2][0] <= 8'h00;  // Register 0: Key data
+    device_registers[2][1] <= 8'h00;  // Register 1: LEDs (if any)
+    device_registers[2][2] <= 8'h00;  // Register 2: Exceptional event data
+    device_registers[2][3] <= 8'h02;  // Register 3: Device ID - keyboard handler ID
+    
+    // Set up mouse device (address 3) default registers  
+    device_registers[3][0] <= 8'h00;  // Register 0: Mouse button/movement data
+    device_registers[3][1] <= 8'h00;  // Register 1: Resolution/settings
+    device_registers[3][2] <= 8'h00;  // Register 2: Class data
+    device_registers[3][3] <= 8'h01;  // Register 3: Device ID - mouse handler ID
+    
+    // Initialize keyboard FIFO
+    kbd_fifo_head <= 4'd0;
+    kbd_fifo_tail <= 4'd0;
+    kbd_fifo_count <= 4'd0;
+    kbd_strobe <= 1'b0;
+    for (int i = 0; i < MAX_KBD_BUF; i++) begin
+      kbd_fifo[i] <= 8'h00;
+    end
+
+    // ADB R0 staging buffer
+    kbd_r0_next <= 8'h00;
+    kbd_r0_next_valid <= 1'b0;
+    kbd_srq_pending <= 1'b0;
+    desk_mgr_pending <= 1'b0;
+
+    // Initialize modifier key states
+    shift_down <= 1'b0;
+    ctrl_down <= 1'b0;
+    option_down <= 1'b0;
+    cmd_down <= 1'b0;
+    reset_key_down <= 1'b0;
+    
+    // Initialize key repeat state
+    ps2_key_held <= 1'b0;
+    held_ps2_key <= 9'd0;
+    held_iie_char <= 8'd0;
+    repeat_vbl_target <= 16'd0;
+    c010_processed_this_strobe <= 1'b0;
+    prev_strobe <= 1'b0;
+
+    // Initialize 60Hz timing
+    clk_60hz_counter <= 18'd0;
+    hz60_count <= 16'd0;
+    repeat_delay_vbl <= 8'd45;              // Default: 45 VBL = 750ms @ 60Hz
+    repeat_rate_vbl <= 8'd3;                // Default: 3 VBL = ~20 repeats/sec
+  end else begin
+    // Default RAM control signals (override when needed)
+    ram_wen <= 1'b0;
+    
+    // Track PS/2 toggle bits for edge detection
+    ps2_key_toggle_prev <= ps2_key[10];
+    ps2_mouse_toggle_prev <= ps2_mouse[24];
+    
+    // Track strobe signal to detect transaction boundaries
+    prev_strobe <= strobe;
+    
+    // Clear C010 processing flag when strobe goes low (end of bus transaction)
+    if (prev_strobe && !strobe) begin
+      c010_processed_this_strobe <= 1'b0;
+    end
+    
+    // Generate 60Hz counter from 14MHz clock
+    if (clk_60hz_counter >= CLK_60HZ_PERIOD - 1) begin
+      clk_60hz_counter <= 18'd0;
+      hz60_count <= hz60_count + 16'd1;  // Increment 60Hz counter
+    end else begin
+      clk_60hz_counter <= clk_60hz_counter + 18'd1;
+    end
+    
+    // PS/2 keyboard event processing
+    // MiSTer toggles bit 10 on every key press/release - if toggle changed, it's a valid new event
+    if (ps2_key[10] != ps2_key_toggle_prev) begin
+`ifdef DEBUG_VERBOSE
+      $display("ADB: PS2 KEY EVENT: key=%03h down=%0d", ps2_key[8:0], ps2_key[9]);
+`endif
+      
+      // Handle Caps Lock on the physical key-down edge only. MiSTer PS/2
+      // input reports both press and release, so toggling on every event
+      // would immediately cancel the latch when the key is released.
+      // Synthesize a full ADB press+release pair for each activation so
+      // the diag ADB keyboard test sees both halves.
+      if (ps2_key[8:0] == 9'h058 && ps2_key[9]) begin
+        caps_lock_state <= ~caps_lock_state;
+        capslock <= ~caps_lock_state;
+        if (device_data_pending[2] == 8'h00) begin
+          device_registers[2][0] <= 8'h39;          // press (bit7=0)
+          kbd_r0_next <= 8'hB9;                     // release (bit7=1)
+          kbd_r0_next_valid <= 1'b1;
+          device_data_pending[2] <= 8'h01;
+        end else if (!kbd_r0_next_valid) begin
+          // Live slot full — stage the press; release will be reported
+          // as missing but the next TALK R0 will eventually drain.
+          kbd_r0_next <= 8'h39;
+          kbd_r0_next_valid <= 1'b1;
+        end
+        // If both slots full, the tap is dropped silently; the test
+        // accepts the next one after the host drains via TALK R0.
+        valid_kbd <= 1'b1;
+      end
+      
+      // Handle modifier keys (only when selftest override is not active)
+      if (!selftest_override) begin
+        case(ps2_key[8:0])
+          9'h012, 9'h059: begin  // Left/Right Shift
+            shift_down <= ps2_key[9];
+            apple_shift <= ps2_key[9];
+          end
+          9'h014, 9'h114: begin  // Left/Right Ctrl
+            ctrl_down <= ps2_key[9];
+            apple_ctrl <= ps2_key[9];
+          end
+          9'h011, 9'h111: begin  // Left/Right Alt (Command)
+            cmd_down <= ps2_key[9];
+            open_apple <= ps2_key[9];
+          end
+          9'h11f, 9'h127: begin  // Windows/Menu keys (Option)
+            option_down <= ps2_key[9];
+            closed_apple <= ps2_key[9];
+          end
+          default: ;
+        endcase
+      end
+      
+      // Track F11 (PS/2 0x078) as the Apple Reset key
+      // Reset key is special - it doesn't generate characters but signals reset intent
+      if (ps2_key[8:0] == 9'h078) begin  // F11 -> Reset key
+        reset_key_down <= ps2_key[9];  // Track press/release state
+`ifdef DEBUG_ADB
+        if (ps2_key[9]) begin
+          $display("ADB: RESET KEY (F11) PRESSED - ctrl_down=%0d open_apple=%0d closed_apple=%0d", ctrl_down, open_apple, closed_apple);
+        end else begin
+          $display("ADB: RESET KEY (F11) RELEASED");
+        end
+`endif
+      end
+
+      // Process normal keys (not caps lock or reset key), and — when keyboard
+      // autopoll is OFF — also the modifier keys.
+      //
+      // A real ADB keyboard emits Register-0 make/break keycodes for the
+      // modifier keys (Control=$36, Command=$37, Shift=$38, Option=$3A) exactly
+      // like any other key; the $C025 modifier byte is maintained separately by
+      // the ADB GLU. Games that disable autopoll and read raw keycodes via SRQ
+      // (e.g. Wolfenstein 3D IIgs: Control=fire, Option=strafe, Shift=run) rely
+      // on those R0 events. So in autopoll-OFF mode we let modifiers generate R0
+      // keycodes too. In autopoll-ON mode we keep them OUT of R0 (state via
+      // $C025 only) to match the normal IIgs keyboard path and the ADB diag
+      // test. Modifiers have temp_iie_char==$FF so they never reach the IIe
+      // ASCII FIFO or the auto-repeat path regardless of mode.
+      //
+      // Caps Lock (0x058) is handled above with a synthesized press+release
+      // pair — skip it here. F11 (0x078) is bound to the Apple Reset key combo.
+      if (((ps2_key[8:0] != 9'h012 && ps2_key[8:0] != 9'h059 &&  // Shift
+            ps2_key[8:0] != 9'h014 && ps2_key[8:0] != 9'h114 &&  // Ctrl
+            ps2_key[8:0] != 9'h011 && ps2_key[8:0] != 9'h111 &&  // Alt (Command)
+            ps2_key[8:0] != 9'h11f && ps2_key[8:0] != 9'h127)    // Win/Menu (Option)
+           || kbd_autopoll_off) &&
+          ps2_key[8:0] != 9'h058 &&                             // Caps Lock
+          ps2_key[8:0] != 9'h078) begin                         // F11 (Reset key)
+        reg [7:0] temp_apple_key;
+        reg [7:0] temp_iie_char;
+
+        temp_apple_key = ps2_to_apple_key(ps2_key[8:0]);
+
+        if (temp_apple_key != 8'h7F) begin
+          if (ps2_key[9]) begin  // Key pressed (not released)
+`ifdef DEBUG_VERBOSE
+            $display("ADB: PS2 KEY DOWN: PS2=%03h Apple=%02h", ps2_key[8:0], temp_apple_key);
+`endif
+            temp_iie_char = adb_to_apple_iie_ascii(
+              temp_apple_key[6:0],
+              shift_down,
+              ctrl_down,
+              caps_lock_state
+            );
+
+            // IIgs Ctrl-OpenApple-Esc -> Desk Manager (Control Panel CDA).
+            // On Escape ($35) key-DOWN while Control+Command are held, the ADB
+            // GLU flags it for the firmware via $C026 bit5 + an ADB data IRQ
+            // (see desk_mgr_pending decl). Works in autopoll-ON (the desktop).
+            if (temp_apple_key == 8'h35 && ctrl_down && cmd_down) begin
+              desk_mgr_pending <= 1'b1;
+            end
+`ifdef DEBUG_DESKMGR
+            if (temp_apple_key == 8'h35)
+              $display("DESKMGR: Esc down ctrl=%0d cmd=%0d shift=%0d data_int=%0d -> set=%0d",
+                       ctrl_down, cmd_down, shift_down, data_int, (ctrl_down && cmd_down));
+`endif
+
+            // Track this key as held down for potential repeat. This must NOT be
+            // Only ASCII keys auto-repeat (matches the IIe $C000 repeat path).
+            if (is_repeatable_key(temp_apple_key) && temp_iie_char != 8'hFF) begin
+              ps2_key_held <= 1'b1;
+              held_ps2_key <= ps2_key[8:0];  // Store PS/2 scancode
+              held_iie_char <= temp_iie_char;   // Store ASCII for repeat
+
+              // Set initial repeat timer (first repeat after delay)
+              repeat_vbl_target <= hz60_count + {8'd0, repeat_delay_vbl};
+            end
+
+            // ADB TALK R0 delivery is INDEPENDENT of IIe FIFO state — the
+            // diagnostic keyboard test reads ADB and does not drain the
+            // IIe FIFO, so gating ADB push on FIFO-space would cause
+            // "release without press" (flagged as stuck) once the FIFO
+            // fills. Route through the 1-deep staging buffer so a quick
+            // release can't overwrite an un-consumed press.
+            valid_kbd <= 1'b1;
+            // Raise keyboard SRQ for raw-event consumers (autopoll off).
+            if (kbd_autopoll_off) begin
+              kbd_srq_pending <= 1'b1;
+            end
+            if (device_data_pending[2] == 8'h00) begin
+              device_registers[2][0] <= {1'b0, temp_apple_key[6:0]};
+              device_data_pending[2] <= 8'h01;
+            end else begin
+              kbd_r0_next <= {1'b0, temp_apple_key[6:0]};
+              kbd_r0_next_valid <= 1'b1;
+            end
+
+            // Only populate the IIe keyboard FIFO / K register for keys
+            // that produce an ASCII character. Caps Lock / modifiers
+            // have temp_iie_char == 0xFF and shouldn't waste FIFO slots.
+            if (temp_iie_char != 8'hFF &&
+                kbd_fifo_count < MAX_KBD_BUF[3:0]) begin
+              kbd_fifo[kbd_fifo_head[2:0]] <= temp_apple_key;
+              kbd_fifo_head <= (kbd_fifo_head + 4'd1) & 4'd7;  // MAX_KBD_BUF-1 mask
+              kbd_fifo_count <= kbd_fifo_count + 4'd1;
+
+`ifdef DEBUG_ADB
+              $display("ADB: Setting K register: PS2=%03h Apple=%02h ASCII=%02h", ps2_key[8:0], temp_apple_key, temp_iie_char);
+`endif
+              K <= {1'b1, temp_iie_char[6:0]};  // Set strobe bit + 7-bit ASCII
+              akd <= 1'b1;  // Any key down
+            end
+          end else begin
+            // Key released
+`ifdef DEBUG_VERBOSE
+            $display("ADB: PS2 KEY UP: PS2=%03h (held=%03h held_flag=%0d)", ps2_key[8:0], held_ps2_key, ps2_key_held);
+`endif
+            // Stop repeat if this was the held PS/2 key
+            if (ps2_key_held && (ps2_key[8:0] == held_ps2_key)) begin
+              ps2_key_held <= 1'b0;
+              held_ps2_key <= 9'd0;
+              held_iie_char <= 8'd0;
+              repeat_vbl_target <= 16'd0;
+              c025[3] <= 1'b0;  // Clear repeat function flag
+            end
+
+            // Deliver a release event on the ADB TALK keyboard/R0 path via
+            // the same 1-deep staging buffer used by the press side, so a
+            // quick tap (press → release before the host polls) doesn't have
+            // the release overwrite the un-consumed press. Without this the
+            // diagnostic disk "ADB Keyboard Test" intermittently sees the
+            // release-only half and flags "key stuck in down position".
+            if (device_data_pending[2] == 8'h00) begin
+              device_registers[2][0] <= {1'b1, temp_apple_key[6:0]};
+              device_data_pending[2] <= 8'h01;
+            end else begin
+              kbd_r0_next <= {1'b1, temp_apple_key[6:0]};
+              kbd_r0_next_valid <= 1'b1;
+            end
+            valid_kbd <= 1'b1;
+            // Raise keyboard SRQ for raw-event consumers (autopoll off).
+            if (kbd_autopoll_off) kbd_srq_pending <= 1'b1;
+
+            akd <= 1'b0;  // Clear any key down
+          end
+        end
+      end
+    end
+    
+    // Key repeat. Gate only on the ADB-side event register having been
+    // drained (device_data_pending[2] == 0) and on the VBL-count-based
+    // target time having been reached. We deliberately DO NOT gate on
+    // kbd_fifo_count here — the FIFO is consumed by the IIe $C000/$C010
+    // path, and a test that reads only the ADB TALK R0 path (e.g. the diag
+    // ADB keyboard test) wouldn't drain it, which would otherwise wedge
+    // repeat forever. We also use `>=` (with modulo-16 wraparound) rather
+    // than `==` so a missed cycle doesn't cost a full 60Hz-counter
+    // rollover. `repeat_delay_vbl == 0` means "no repeat" per ADB config.
+    // ADB key auto-repeat (autopoll-on / IIe $C000 path only). Suppressed when
+    // keyboard autopoll is OFF: SRQ raw-event consumers track held state from
+    // clean down/up transitions, and the byte-order fix already lets a single
+    // held "down" register (its key-state slot stays set until the up event).
+    if (ps2_key_held && !reset_key_down && !kbd_autopoll_off &&
+        device_data_pending[2] == 8'h00 &&
+        repeat_delay_vbl != 8'd0 &&
+        ((hz60_count - repeat_vbl_target) < 16'h8000)) begin
+      reg [7:0] rep_apple_key;
+      rep_apple_key = ps2_to_apple_key(held_ps2_key);
+      if (rep_apple_key != 8'h7F) begin
+        // Re-push a press event on the ADB TALK R0 path. We intentionally
+        // don't also re-push into kbd_fifo or re-strobe K here: the existing
+        // $C010-gated repeat at line ~1769 handles the IIe $C000 path, and
+        // doubling up would double-count characters.
+        device_registers[2][0] <= {1'b0, rep_apple_key[6:0]};
+        device_data_pending[2] <= 8'h01;
+        valid_kbd <= 1'b1;
+        c025[3] <= 1'b1;                    // Report "repeat-active" on $C025 bit3
+        // Schedule the next repeat at the post-initial-delay rate.
+        repeat_vbl_target <= hz60_count + {8'd0, repeat_rate_vbl};
+      end
+    end
+
+
+    // PS/2 mouse event processing
+    // PS/2 format: [7:0]=status (bit0=lbtn, bit1=rbtn, bit2=mbtn, bit3=1, bit4=Xsign, bit5=Ysign)
+    //              [15:8]=X delta, [23:16]=Y delta, [24]=toggle
+    // MiSTer only toggles bit 24 when there's meaningful data (movement or button change)
+    if (ps2_mouse[24] != ps2_mouse_toggle_prev) begin
+      // Build ADB mouse data format (2 bytes per Apple IIgs spec):
+      // Byte 0: bit7=~button, bits6:0=Y delta (clamped to 7-bit signed, -63 to +63)
+      // Byte 1: bit7=1, bits6:0=X delta (clamped to 7-bit signed, -63 to +63)
+
+      // Clamp X delta from 8-bit signed to 7-bit signed range (-63 to +63)
+      // ps2_mouse[15:8] is 8-bit signed X delta
+      if ($signed(ps2_mouse[15:8]) > 63)
+        device_registers[3][1] <= {1'b1, 7'd63};      // Clamp to +63
+      else if ($signed(ps2_mouse[15:8]) < -63)
+        device_registers[3][1] <= {1'b1, 7'b1000001}; // Clamp to -63 (0x41 in 7-bit signed)
+      else
+        device_registers[3][1] <= {1'b1, ps2_mouse[14:8]};
+
+      // Clamp Y delta from 8-bit signed to 7-bit signed range (-63 to +63)
+      // ps2_mouse[23:16] is 8-bit signed Y delta
+      // Negate Y for Apple IIgs screen coordinates (positive Y = cursor moves down)
+      // Note: Must negate the full 8-bit value, then take lower 7 bits for ADB format
+      if ($signed(ps2_mouse[23:16]) > 63)
+        device_registers[3][0] <= {~ps2_mouse[0], 7'b1000001}; // Clamp to -63 (negated)
+      else if ($signed(ps2_mouse[23:16]) < -63)
+        device_registers[3][0] <= {~ps2_mouse[0], 7'd63};      // Clamp to +63 (negated)
+      else begin
+        // Negate the 8-bit signed Y value, then extract lower 7 bits
+        reg signed [7:0] neg_y;
+        neg_y = -$signed(ps2_mouse[23:16]);
+        device_registers[3][0] <= {~ps2_mouse[0], neg_y[6:0]};
+      end
+
+      valid_mouse_data <= 1'b1;
+      device_data_pending[3] <= 8'h02;  // 2 bytes available
+
+`ifdef DEBUG_ADB
+      $display("ADB MOUSE: X=%d Y=%d btn=%d -> reg0=0x%02h reg1=0x%02h",
+               $signed(ps2_mouse[15:8]), $signed(ps2_mouse[23:16]), ps2_mouse[0],
+               {~ps2_mouse[0], ps2_mouse[22:16]}, {1'b1, ps2_mouse[14:8]});
+`endif
+    end
+    
+    // Timeout handling for stuck commands
+    if (state == CMD) begin
+      cmd_timeout <= cmd_timeout + 16'd1;
+      if (cmd_timeout >= 16'd32000) begin  // ~2ms timeout at 14MHz
+        state <= IDLE;
+        cmd_full <= 1'b0;
+        cmd_timeout <= 16'd0;
+      end
+    end else begin
+      cmd_timeout <= 16'd0;
+    end
+    
+    // Self-test override: simulate Command+Option+Control pressed
+    // This must be outside PS/2 processing to work continuously
+    if (selftest_override) begin
+      cmd_down <= 1'b1;
+      option_down <= 1'b1;
+      ctrl_down <= 1'b1;
+
+      // Also set Apple IIe compatibility flags
+      open_apple <= 1'b1;     // Command key maps to open apple
+      closed_apple <= 1'b1;   // Option key maps to closed apple
+      apple_ctrl <= 1'b1;     // Control key
+    end else if (selftest_override_prev) begin
+      // Force Self Test just turned OFF (1->0 edge): release the forced keys so
+      // they don't stick. Nothing else clears them until a real PS/2 make/break
+      // arrives, so a stuck open_apple leaves Ctrl+F11 reading as
+      // Ctrl+OpenApple+F11 -> COLD reset instead of the intended warm reset
+      // (keyboard_cold_reset = reset_key & ctrl & open_apple in iigs.sv). Clear
+      // all six forced flags here on the edge.
+      cmd_down     <= 1'b0;
+      option_down  <= 1'b0;
+      ctrl_down    <= 1'b0;
+      open_apple   <= 1'b0;
+      closed_apple <= 1'b0;
+      apple_ctrl   <= 1'b0;
+    end
+    selftest_override_prev <= selftest_override;
+
+    // Key repeat moved back to $C000 reads - no background repeat generation
+
+    // DATA state: Complete the IDLE transition after CPU finishes reading (strobe falls)
+    // This prevents the IDLE handler from overwriting dout while the CPU is still
+    // latching the last data byte from a DATA state read.
+    if (data_last_byte_read && !strobe) begin
+      state <= IDLE;
+      data <= 32'h00000008;  // SRQ bit set, ready for keyboard operations
+      data_last_byte_read <= 1'b0;
+`ifdef DEBUG_ADB
+      $display("ADB DATA->IDLE: strobe fell, transitioning to IDLE");
+`endif
+    end
+
+    // CMD state machine: When all bytes received, transition to CMD_EXEC for 1-cycle delay
+    // This delay is needed because ROM reads are synchronous (1-cycle latency)
+    if (state == CMD && cmd_len == 4'd0) begin
+`ifdef DEBUG_ADB
+      $display("ADB CMD: All bytes received, transitioning to CMD_EXEC for cmd=0x%02h cmd_data=%016x", cmd, cmd_data);
+`endif
+      state <= CMD_EXEC;  // Wait one cycle for ROM/RAM data to be ready
+    end
+
+    // CMD_EXEC state: Execute command after ROM data is ready
+    if (state == CMD_EXEC) begin
+`ifdef DEBUG_ADB
+      $display("ADB CMD EXEC: cmd=0x%02h cmd_data=%016x", cmd, cmd_data);
+`endif
+      state <= IDLE;
+      // Don't set cmd_response_ready here - each command sets it as needed
+      // Microcontroller commands go directly to DATA state (no status byte)
+
+      case (cmd)
+        8'h09: begin
+          // READ_MEM - Read byte from ADB controller memory (2 bytes)
+          // cmd_data[15:8] = address LOW byte (first byte sent)
+          // cmd_data[7:0] = address HIGH byte (second byte sent)
+          // Full 16-bit address = (cmd_data[7:0] << 8) | cmd_data[15:8]
+
+`ifdef DEBUG_ADB
+          $display("ADB READ_MEM: addr=0x%04h (bytes: low=0x%02h high=0x%02h)", {cmd_data[7:0], cmd_data[15:8]}, cmd_data[15:8], cmd_data[7:0]);
+`endif
+
+          if ({cmd_data[7:0], cmd_data[15:8]} < 16'h0100) begin
+            // RAM area (0x00-0xFF): Read from RAM
+            ram_addr <= cmd_data[15:8];  // Only low byte matters for RAM
+            ram_wen <= 1'b0;
+
+            // Special handling for specific addresses (from gsplus)
+            case (cmd_data[15:8])
+              8'h01: begin
+                // ROM checksum low byte - actual ROM3 checksum is 0x6330
+                data <= { 24'd0, 8'h30 };
+`ifdef DEBUG_ADB
+                $display("ADB READ_MEM: Special addr 0x01 -> 0x30 (ROM checksum low)");
+`endif
+              end
+              8'h03: begin
+                // ROM checksum high byte - ROM3=0x63, ROM1=0xAA (from actual ROM files)
+                if (VERSION >= 6) begin
+                  data <= { 24'd0, 8'h63 };
+`ifdef DEBUG_ADB
+                  $display("ADB READ_MEM: Special addr 0x03 -> 0x63 (ROM checksum high ROM3)");
+`endif
+                end else begin
+                  data <= { 24'd0, 8'hAA };  // ROM1 checksum is 0xAAEA
+`ifdef DEBUG_ADB
+                  $display("ADB READ_MEM: Special addr 0x03 -> 0xAA (ROM checksum high ROM1)");
+`endif
+                end
+              end
+              8'h0B: begin
+                // Special key state byte for Out of This World (ROM 1)
+                data <= { 24'd0, 8'h00 };
+`ifdef DEBUG_ADB
+                $display("ADB READ_MEM: Special addr 0x0B -> 0x00");
+`endif
+              end
+              8'h0C: begin
+                // Special key state byte for Out of This World (ROM 3)
+                data <= { 24'd0, 8'h00 };
+`ifdef DEBUG_ADB
+                $display("ADB READ_MEM: Special addr 0x0C -> 0x00");
+`endif
+              end
+              8'hE2: begin
+                // No Apple IIe keyboard support (bits 1 and 2 = 1)
+                data <= { 24'd0, 8'h06 };
+`ifdef DEBUG_ADB
+                $display("ADB READ_MEM: Special addr 0xE2 -> 0x06 (no IIe keyboard)");
+`endif
+              end
+              8'hE8: begin
+                // Apple/Option key state
+                data <= { 24'd0, 8'h00 };
+`ifdef DEBUG_ADB
+                $display("ADB READ_MEM: Special addr 0xE8 -> 0x00 (no Apple/Option keys)");
+`endif
+              end
+              default: begin
+                // Normal RAM read
+                data <= { 24'd0, ram_dout };
+`ifdef DEBUG_ADB
+                $display("ADB READ_MEM: RAM addr=0x%02h data=0x%02h", cmd_data[15:8], ram_dout);
+`endif
+              end
+            endcase
+          end else if ({cmd_data[7:0], cmd_data[15:8]} >= 16'h1000 && {cmd_data[7:0], cmd_data[15:8]} < 16'h2000) begin
+            // ROM area (0x1000-0x1FFF): Read from loaded ADB ROM
+            // Address = {high, low} = {cmd_data[7:0], cmd_data[15:8]}
+            // Index = address - 0x1000 = low 12 bits
+            // ROM data is available via adb_rom_data (synchronous, 1-cycle latency)
+            // Address was set combinationally, data is ready on this clock edge
+            data <= { 24'd0, adb_rom_data };
+`ifdef DEBUG_ADB
+            $display("ADB READ_MEM: ROM addr 0x%04h idx=0x%03h -> 0x%02h",
+                     {cmd_data[7:0], cmd_data[15:8]},
+                     {cmd_data[3:0], cmd_data[15:8]},
+                     adb_rom_data);
+`endif
+          end else begin
+            // Out of range
+            data <= { 24'd0, 8'h00 };
+`ifdef DEBUG_ADB
+            $display("ADB READ_MEM: addr 0x%04h out of range -> 0x00", {cmd_data[7:0], cmd_data[15:8]});
+`endif
+          end
+          pending_data <= 3'd1;
+          // KEGS goes directly to SENDING_DATA (no status byte) for microcontroller commands
+          // The first C026 read returns the data directly
+          state <= DATA;
+        end
+        // ----------------------------------------------------------------
+        // Microcontroller "register" commands. These MUST execute here in
+        // CMD_EXEC (the real completion path) using the bytes collected into
+        // cmd_data. Previously the handlers lived in a dead write-handler
+        // branch (cmd_len==0) that never ran because state transitions to
+        // CMD_EXEC first, so e.g. Set Modes never took effect and keyboard
+        // autopoll could never be disabled (breaking SRQ-based games like
+        // Wolfenstein 3D). Use cmd_data[7:0] for the last data byte (NOT din,
+        // which is stale by the time CMD_EXEC runs).
+        // ----------------------------------------------------------------
+        8'h04: begin
+          // SET MODES: OR mode bits into adb_mode (bit0=kbd autopoll off, bit1=mouse).
+          adb_mode <= cmd_data[7:0] | adb_mode;
+        end
+        8'h05: begin
+          // CLEAR MODES: clear requested mode bits.
+          adb_mode <= adb_mode & ~cmd_data[7:0];
+        end
+        8'h06: begin
+          // SET CONFIG (3 bytes): byte1=addrs, byte3=repeat_info.
+          mouse_ctl_addr <= {4'd0, cmd_data[23:20]};
+          kbd_ctl_addr   <= {4'd0, cmd_data[19:16]};
+          repeat_info    <= cmd_data[7:0];
+          repeat_delay_vbl <= delay_to_vbl_count(cmd_data[6:4]);
+          repeat_rate_vbl  <= rate_to_vbl_count(cmd_data[3:0], 1'b0);
+        end
+        8'h07: begin
+          // SYNC: ROM1 = 4 bytes, ROM3 = 8 bytes.
+          if (initial_cmd_len == 4'd4) begin // ROM1
+            adb_mode       <= cmd_data[31:24];
+            mouse_ctl_addr <= {4'd0, cmd_data[23:20]};
+            kbd_ctl_addr   <= {4'd0, cmd_data[19:16]};
+            repeat_info    <= cmd_data[7:0];
+            repeat_delay_vbl <= delay_to_vbl_count(cmd_data[6:4]);
+            repeat_rate_vbl  <= rate_to_vbl_count(cmd_data[3:0], (cmd_data[31:24] & 8'h08) != 8'h00);
+          end else begin // ROM3 (8 bytes)
+            adb_mode       <= cmd_data[63:56];
+            mouse_ctl_addr <= {4'd0, cmd_data[55:52]};
+            kbd_ctl_addr   <= {4'd0, cmd_data[51:48]};
+            repeat_info    <= cmd_data[39:32];
+            char_set       <= cmd_data[23:16];
+            layout         <= cmd_data[15:8];
+            repeat_delay_vbl <= delay_to_vbl_count(cmd_data[38:36]);
+            repeat_rate_vbl  <= rate_to_vbl_count(cmd_data[35:32], (cmd_data[63:56] & 8'h08) != 8'h00);
+          end
+          $display("ADB_SYNC: mode=%02h", (initial_cmd_len==4'd4) ? cmd_data[31:24] : cmd_data[63:56]);
+        end
+        8'h08: begin
+          // WRITE MEM (2 bytes): addr=cmd_data[15:8], value=cmd_data[7:0].
+          if (cmd_data[15:8] < 8'h60) begin
+            ram_addr <= cmd_data[15:8];
+            ram_din  <= cmd_data[7:0];
+            ram_wen  <= 1'b1;
+          end
+        end
+        8'h11: ; // SEND KEYCODE DATA - accepted, no-op for now
+        8'h12: ; // ROM3-only, no-op
+        8'h13: ; // ROM3-only, no-op
+        default: begin
+          // Device LISTEN (cmd[1:0]==10, addr in cmd[7:4]): store register data.
+          if (cmd >= 8'h10 && cmd[1:0] == 2'b10 && device_present[cmd[7:4]]) begin
+            device_registers[cmd[7:4]][cmd[3:2]] <= cmd_data[15:8];
+          end
+`ifdef DEBUG_ADB
+          else $display("ADB CMD EXEC: cmd=0x%02h not handled", cmd);
+`endif
+        end
+      endcase
+    end
+
+    // Address decoding and register access
+    // Note: removed noisy debug output that fired every clock
+    case (addr)
+
+      8'h25: begin  // $C025 - Modifier Key Register
+        if (rw) begin
+          // Return actual modifier key states, not stored c025 value
+          // Bit 7: Command key down (open apple)
+          // Bit 6: Option key down (closed apple)
+          // Bit 5: Updated modifier key latch (not implemented)
+          // Bit 4: Numeric keypad key down (not implemented)
+          // Bit 3: Repeat function active
+          // Bit 2: Caps Lock active
+          // Bit 1: Control key down
+          // Bit 0: Shift key down
+          dout <= {cmd_down, option_down, 1'b0, 1'b0, c025[3], caps_lock_state, ctrl_down, shift_down};
+        end else if (cen & strobe) begin
+          c025 <= din;
+        end
+      end
+
+      8'h26: begin
+        // Read $C026 - ADB Command/Data Register
+        if (rw) begin
+          case (state)
+            IDLE: begin
+              // Build response byte per documentation (Table 6-3):
+              // Bit 7: Response received (set when command completes)
+              // Bit 6: Abort/error
+              // Bit 5: Reset key sequence
+              // Bit 4: Buffer flush key sequence
+              // Bit 3: SRQ (keyboard ready)
+              // Bits 2-0: Number of data bytes to return
+              if (cmd_response_ready) begin
+                // Command completed - return response with bit 7 set
+                // Format: bit 7=response, bits 2-0=(count-1) where count is # of data
+                // bytes to follow. Matches Clemens ADB protocol exactly.
+                if (pending_data > 3'd0) begin
+                  dout <= 8'h80 | {5'd0, pending_data - 3'd1};
+                  // Mark that the response header was read while a read strobe is
+                  // active. The IDLE->DATA transition is performed on the strobe
+                  // FALLING edge (handler below), AFTER the CPU has latched the
+                  // header. The previous rising-edge transition gated on cen (phi2)
+                  // could silently miss when the strobe rising edge did not
+                  // coincide with cen, leaving C026 stuck returning the header
+                  // forever (e.g. the autopoll-off ADB-SRQ command-response path
+                  // the ROM IRQ handler at FF:BE67 / FC:DB30 walks). Falling-edge
+                  // delivery mirrors the working C024 mouse register mechanism.
+                  if (strobe & (addr == 8'h26)) c026_status_read_with_data <= 1'b1;
+                end else begin
+                  dout <= 8'h80;  // Response received, no data
+                  // Clear on rising edge only
+                  if (strobe & ~strobe_prev) begin
+                    cmd_response_ready <= 1'b0;  // Clear after returning status
+`ifdef DEBUG_ADB
+                    $display("ADB C026: returning 0x80, no data");
+`endif
+                  end
+                end
+              end else begin
+                // No command response - return SRQ status (bit 3) when a
+                // keyboard service request is pending, else 0x00. (bit 4 is the
+                // legacy pending_irq path.) Bit 5 (0x20) signals a pending
+                // Ctrl-OA-Esc Desk Manager request; it is one-shot — cleared on
+                // this read so the firmware's IRQ handler sees it exactly once.
+                dout <= (kbd_srq_pending ? 8'h08 : 8'h00) | (pending_irq ? 8'h10 : 8'h00) | (desk_mgr_pending ? 8'h20 : 8'h00);
+`ifdef DEBUG_DESKMGR
+                if (desk_mgr_pending)
+                  $display("DESKMGR: C026 IDLE read while pending (strobe=%0d prev=%0d data_int=%0d) -> 0x20 delivered",
+                           strobe, strobe_prev, data_int);
+`endif
+                // Defer the desk-mgr clear to the strobe FALLING edge (handler
+                // below). The CPU reads the combinational dout_comb, so clearing
+                // desk_mgr_pending on the rising edge raced the read and the CPU
+                // latched 0x00 -> the ROM IRQ handler (FF:BE67) saw no desk-mgr
+                // bit and never opened the Control Panel. Mirrors the cmd-response
+                // (c026_status_read_with_data) falling-edge mechanism.
+                if (desk_mgr_pending & strobe & (addr == 8'h26))
+                  deskmgr_read_with_pending <= 1'b1;
+                // No debug here - too noisy
+              end
+            end
+            CMD: begin
+              // Return 0x00 during CMD state (waiting for data bytes)
+              // KEGS returns 0 here - returning 0x80 would make ROM think command completed
+              dout <= 8'h00;
+              // No debug here - too noisy
+            end
+            DATA: begin
+              dout <= data[7:0];
+              // Only advance on strobe RISING edge (first clock of read)
+              // This prevents consuming data multiple times during one bus read
+              if (strobe & ~strobe_prev) begin
+`ifdef DEBUG_ADB
+                $display("ADB C026 DATA: returning 0x%02h, pending=%d", data[7:0], pending_data);
+`endif
+                // Shift data and decrement counter on rising edge only
+                if (pending_data == 3'd1) begin
+                  // Last data byte - DON'T transition to IDLE yet!
+                  // The CPU hasn't latched dout yet. If we go to IDLE now,
+                  // the IDLE handler will overwrite dout with 0x00 on the next
+                  // clock while strobe is still high, corrupting the read.
+                  // Instead, set a flag to transition after strobe falls.
+                  data_last_byte_read <= 1'b1;
+                end else begin
+                  data <= { 8'd0, data[31:8] };
+                end
+                if (pending_data > 3'd0) pending_data <= pending_data - 3'd1;
+              end
+            end
+            default: ;
+          endcase
+          // Note: State transitions for IDLE->DATA moved outside address case block
+          // (see c026_status_read_with_data handling below c024_was_read handling)
+        end
+        // Write $C026 - ADB Commands
+        // Detect write on: (1) strobe rising edge, OR (2) read->write transition while strobe high
+        // Case 2 handles back-to-back read->write where strobe doesn't go low between accesses
+        else if ((strobe & ~strobe_prev) | (strobe & ~rw & rw_prev)) begin
+`ifdef DEBUG_ADB
+          $display("ADB_MODULE_WR_C026: cen=%b strobe=%b din=%02h [PROCESSING]", cen, strobe, din);
+`endif
+          case (state)
+
+            IDLE: begin
+`ifdef DEBUG_ADB
+              $display("ADB PROCESSING WRITE in IDLE state");
+              $display("ADB WRITE C026 IDLE: din=0x%02h, prev_cmd=0x%02h, state=%d, cmd_len=%d", din, cmd, state, cmd_len);
+`endif
+              cmd <= din;
+              cmd_timeout <= 16'd0;  // Reset timeout for new command
+              cmd_data <= 64'd0;     // Clear command data buffer
+              initial_cmd_len <= 4'd0; // Clear initial length
+              case (din)
+                8'h01: begin
+                  // ABORT - Clear all ADB state including key repeat
+                  ps2_key_held <= 1'b0;
+                  repeat_vbl_target <= 16'd0;
+                end
+                8'h03: begin
+                  // FLUSH keyboard buffer - also stop key repeat
+                  ps2_key_held <= 1'b0;
+                  repeat_vbl_target <= 16'd0;
+
+                  // Clear keyboard FIFO
+                  kbd_fifo_head <= 4'd0;
+                  kbd_fifo_tail <= 4'd0;
+                  kbd_fifo_count <= 4'd0;
+                  kbd_strobe <= 1'b0;
+                  valid_kbd <= 1'b0;
+                end
+                8'h04: begin cmd_len <= 4'd1; initial_cmd_len <= 4'd1; state <= CMD; end
+                8'h05: begin cmd_len <= 4'd1; initial_cmd_len <= 4'd1; state <= CMD; end
+                8'h06: begin cmd_len <= 4'd3; initial_cmd_len <= 4'd3; state <= CMD; end
+                8'h07: begin
+                  // SYNC command - length depends on ROM version
+                  // ROM1 (VERSION=5): 4 bytes, ROM3 (VERSION=6): 8 bytes
+                  // KEGS: g_rom_version == 1 means ROM01, which maps to our VERSION < 6
+                  cmd_len <= (VERSION < 6) ? 4'd4 : 4'd8;
+                  initial_cmd_len <= (VERSION < 6) ? 4'd4 : 4'd8;
+                  state <= CMD;
+                end
+                8'h08: begin
+                  cmd_len <= 4'd2; initial_cmd_len <= 4'd2; state <= CMD;
+`ifdef DEBUG_ADB
+                  $display("ADB CMD 0x08: Transitioning to CMD state, cmd_len=2");
+`endif
+                end
+                8'h09: begin
+                  cmd_len <= 4'd2; initial_cmd_len <= 4'd2; state <= CMD;
+`ifdef DEBUG_ADB
+                  $display("ADB CMD 0x09 (READ_MEM): Transitioning to CMD state, cmd_len=2");
+`endif
+                end
+                8'h0a: begin
+                  // Read ADB modes - KEGS goes directly to SENDING_DATA (no status byte)
+                  data <= { 24'd0, adb_mode };
+                  pending_data <= 3'd1;
+                  state <= DATA;  // Go directly to DATA state
+                end
+                8'h0b: begin
+                  // Read device info - returns config including repeat_info
+                  // KEGS goes directly to SENDING_DATA (no status byte)
+                  data <= {
+                    {mouse_ctl_addr[3:0], kbd_ctl_addr[3:0]},  // Combined addr byte
+                    repeat_info,   // Key repeat settings
+                    char_set,
+                    layout
+                  };
+                  pending_data <= 3'd4;
+                  state <= DATA;  // Go directly to DATA state
+                end
+                8'h0d: begin
+                  // ADB Version command - return version number
+                  // KEGS goes directly to SENDING_DATA (no status byte)
+                  data <= {24'd0, VERSION[7:0]};  // Clear upper bits, set version in LSB
+                  pending_data <= 3'd1;
+                  state <= DATA;  // Go directly to DATA state
+                end
+                8'h0e: begin
+                  // Read charsets - KEGS goes directly to SENDING_DATA (no status byte)
+                  data <= { 16'd0, 8'd0, 8'd1 };
+                  pending_data <= 3'd2;
+                  state <= DATA;  // Go directly to DATA state
+                end
+                8'h0f: begin
+                  // Read layouts - KEGS goes directly to SENDING_DATA (no status byte)
+                  data <= { 16'd0, 8'd0, 8'h1 };
+                  pending_data <= 3'd2;
+                  state <= DATA;  // Go directly to DATA state
+                end
+                8'h10: soft_reset <= 1'b1;
+                8'h11: begin cmd_len <= 4'd1; initial_cmd_len <= 4'd1; state <= CMD; end
+                8'h12: begin
+                  if (VERSION >= 6) begin
+                    cmd_len <= 4'd2; initial_cmd_len <= 4'd2; state <= CMD;
+                  end else begin
+                    // ROM1 doesn't support command 0x12, return to IDLE
+                    state <= IDLE;
+                  end
+                end
+                8'h13: begin
+                  if (VERSION >= 6) begin
+                    cmd_len <= 4'd2; initial_cmd_len <= 4'd2; state <= CMD;
+                  end else begin
+                    // ROM1 doesn't support command 0x13, return to IDLE
+                    state <= IDLE;
+                  end
+                end
+                8'h73: ; // disable SRQ on mouse
+                // IIgs GLU device commands: high nibble = op, low nibble = device.
+                // $F0-$FF: POLL register 3 (handler ID) — 2 bytes.
+                // Clemens decodes this way; Apple IIgs ROM sends $F2 to probe the
+                // keyboard handler ID during boot.
+                8'hF0, 8'hF1, 8'hF2, 8'hF3, 8'hF4, 8'hF5, 8'hF6, 8'hF7,
+                8'hF8, 8'hF9, 8'hFA, 8'hFB, 8'hFC, 8'hFD, 8'hFE, 8'hFF: begin
+`ifdef DEBUG_VERBOSE
+                  $display("ADB POLL_R3 cmd=%02h dev=%d", din, din[3:0]);
+`endif
+                  if (din[3:0] == 4'd2) begin
+                    // Keyboard register 3: handler ID (low byte first, then high)
+                    // Clemens default keyb_reg[3] = $2202 → returns $02 then $22
+                    data <= { 16'd0, 8'h22, 8'h02 };
+                    pending_data <= 3'd2;
+                    cmd_response_ready <= 1'b1;
+                    state <= IDLE;
+                  end else if (din[3:0] == 4'd3) begin
+                    // Mouse register 3: handler ID
+                    data <= { 16'd0, 8'h63, 8'h03 };
+                    pending_data <= 3'd2;
+                    cmd_response_ready <= 1'b1;
+                    state <= IDLE;
+                  end else begin
+                    // Unknown device: empty response
+                    cmd_response_ready <= 1'b1;
+                    pending_data <= 3'd0;
+                    state <= IDLE;
+                  end
+                end
+                // $C0-$CF: TALK register 0. Device = low nibble (gsplus/Clemens
+                // encoding: bits7-6=cmd(11=Talk), bits5-4=reg(00), bits3-0=device).
+                // $C2 = TALK keyboard(2) R0 — the read the ROM's ADB-SRQ handler
+                // (FC:D83A) issues when keyboard autopoll is off (Wolfenstein 3D).
+                // The IIgs keyboard returns TWO key bytes per R0 poll (the 2nd is
+                // $FF when only one key is queued); a 1-byte response encodes a
+                // header of $80 (count 0) and the ROM would read no key bytes.
+                8'hC0, 8'hC1, 8'hC2, 8'hC3, 8'hC4, 8'hC5, 8'hC6, 8'hC7,
+                8'hC8, 8'hC9, 8'hCA, 8'hCB, 8'hCC, 8'hCD, 8'hCE, 8'hCF: begin
+                  if (din[3:0] == 4'd2 && device_data_pending[2] > 8'd0) begin
+                    // TALK keyboard R0: returns the keyboard reg0 word. The ADB GLU
+                    // presents it LOW byte first (gsplus adb_response_packet:
+                    // g_adb_data[0]=val&0xff), and the IIgs keyboard reg0 word is
+                    // (key0<<8)|key1 — so the host reads key1/filler FIRST, then the
+                    // actual key0 SECOND. data[7:0] is returned first, so put the
+                    // filler/next-event there and the live key in data[15:8].
+                    // (Reversing these makes the game decode the $FF filler as the
+                    // keycode and store the wrong key-table slot -> no kbd movement.)
+                    data <= { 16'd0,
+                              device_registers[2][0],
+                              (kbd_r0_next_valid ? kbd_r0_next : 8'hFF) };
+                    pending_data <= 3'd2;
+                    cmd_response_ready <= 1'b1;
+                    if ((device_registers[2][0] & 8'h80) != 8'd0) valid_kbd <= 1'b0;
+                    device_data_pending[2] <= 8'h00;
+                    kbd_r0_next_valid <= 1'b0;
+                    kbd_srq_pending <= 1'b0;
+                    state <= IDLE;
+                  end else if (din[3:0] == 4'd3 && device_data_pending[3] > 8'd0) begin
+                    // TALK mouse R0: 2 bytes (reg0 = Y/button, reg1 = X).
+                    data <= { 16'd0, device_registers[3][1], device_registers[3][0] };
+                    pending_data <= 3'd2;
+                    cmd_response_ready <= 1'b1;
+                    device_data_pending[3] <= 8'h00;
+                    valid_mouse_data <= 1'b0;
+                    state <= IDLE;
+                  end else begin
+                    // No queued data / device not present: send NO response so the
+                    // firmware moves on to poll other devices (per gsplus).
+                    state <= IDLE;
+                  end
+                end
+                default: begin
+`ifdef DEBUG_ADB
+                  $display("ADB WRITE C026 DEFAULT: din=0x%02h, cmd=0x%02h, din>=0x10=%d, din[1:0]=%b, state=%d", din, cmd, (din >= 8'h10), din[1:0], state);
+`endif
+                  // Check if this is a device command (pattern: AAAARRCCT)
+                  // A=address, R=register, C=command, T=type
+                  if (din >= 8'h10) begin  // Device commands start at 0x10
+`ifdef DEBUG_ADB
+                    $display("ADB DEVICE COMMAND: din=0x%02h, device=%d, cmd=%b", din, din[7:4], din[1:0]);
+`endif
+                    // Decode device command: AAAARRCCT (A=addr, R=reg, C=cmd bits)
+                    case (din[1:0])  // dev_cmd bits
+                      2'b01: begin // FLUSH device
+                        cmd_response_ready <= 1'b1;  // Set response flag
+                        pending_data <= 3'd0;        // No data bytes
+                        state <= IDLE;
+`ifdef DEBUG_ADB
+                        $display("ADB FLUSH device %d: setting cmd_response_ready=1, pending_data=0", din[7:4]);
+`endif
+                      end
+                      2'b10: begin // LISTEN (write to device)
+                        if (device_present[din[7:4]]) begin
+                          cmd_len <= 4'd2;  // Expect 2 data bytes for LISTEN
+                          initial_cmd_len <= 4'd2;
+                          state <= CMD;
+                        end else begin
+                          cmd_response_ready <= 1'b1;  // Set response flag even for non-existent device
+                          pending_data <= 3'd0;        // No data bytes
+                          state <= IDLE;
+                        end
+                      end
+                      2'b11: begin // TALK (read from device)
+                        if (device_present[din[7:4]]) begin
+                          // Check for special multi-byte responses
+                          if (din[7:4] == 4'd2 && din[3:2] == 2'd3) begin
+                            // Keyboard device register 3 - return device handler ID (2 bytes)
+                            data <= { 16'd0, 8'h02, 8'h07 };  // Handler ID=$02, some additional info
+                            pending_data <= 3'd2;
+                          end else if (din[7:4] == 4'd3 && din[3:2] == 2'd3) begin
+                            // Mouse device register 3 - return device handler ID (2 bytes)
+                            data <= { 16'd0, 8'h01, 8'h63 };  // Handler ID=$01, mouse info
+                            pending_data <= 3'd2;
+                          end else if (din[7:4] == 4'd2 && din[3:2] == 2'd0) begin
+                            // Keyboard device register 0 - return key data if available
+                            if (device_data_pending[2] > 0) begin
+                              data <= { 24'd0, device_registers[2][0] };
+                              pending_data <= 3'd1;
+                              // If a staged follow-on event is waiting, promote
+                              // it into the live slot and keep pending=1 so the
+                              // next TALK R0 picks it up. Otherwise mark the
+                              // slot empty.
+                              if (kbd_r0_next_valid) begin
+                                device_registers[2][0] <= kbd_r0_next;
+                                kbd_r0_next_valid <= 1'b0;
+                              end else begin
+                                device_data_pending[2] <= 8'h00;
+                                // Keyboard event queue drained -> clear SRQ.
+                                kbd_srq_pending <= 1'b0;
+                              end
+                              if ((device_registers[2][0] & 8'h80) != 8'd0) valid_kbd <= 1'b0;  // Clear on key release
+                            end else begin
+                              data <= 32'd0;  // No data available
+                              pending_data <= 3'd0;
+                            end
+                          end else if (din[7:4] == 4'd3 && din[3:2] == 2'd0) begin
+                            // Mouse device register 0 - return mouse data if available
+                            // ADB mouse returns 2 bytes: reg0 (Y+button) and reg1 (X)
+                            if (device_data_pending[3] > 0) begin
+                              data <= { 16'd0, device_registers[3][1], device_registers[3][0] };
+                              pending_data <= 3'd2;  // 2 bytes of mouse data
+                              device_data_pending[3] <= 8'h00;  // Clear pending data
+                              valid_mouse_data <= 1'b0;  // Clear flag after reading
+`ifdef DEBUG_ADB
+                              $display("ADB MOUSE READ: returning 0x%02h 0x%02h",
+                                       device_registers[3][0], device_registers[3][1]);
+`endif
+                            end else begin
+                              data <= 32'd0;  // No data available
+                              pending_data <= 3'd0;
+                            end
+                          end else begin
+                            // Return single byte device register data
+                            data <= { 24'd0, device_registers[din[7:4]][din[3:2]] };
+                            pending_data <= 3'd1;
+                          end
+                          cmd_response_ready <= 1'b1;  // Set response flag
+                          state <= IDLE;
+                        end else begin
+                          // Device not present - do NOT send response (per KEGS)
+                          // KEGS doesn't call adb_response_packet for non-present devices
+                          // This allows the ROM to poll multiple devices and only get
+                          // responses from devices that actually exist
+                          state <= IDLE;
+`ifdef DEBUG_ADB
+                          $display("ADB TALK device %d (NOT PRESENT): no response sent", din[7:4]);
+`endif
+                        end
+                      end
+                      default: begin
+                        state <= IDLE;
+                      end
+                    endcase
+                  end else begin
+                    // Non-device command - unknown
+                    state <= IDLE;
+                  end
+                end
+              endcase
+            end
+
+            CMD: begin
+`ifdef DEBUG_ADB
+              $display("ADB CMD state: din=0x%02h cmd=0x%02h cmd_len=%d initial_cmd_len=%d", din, cmd, cmd_len, initial_cmd_len);
+`endif
+
+              // First,store incoming data byte and decrement counter (if cmd_len > 0)
+              // This must happen BEFORE we try to execute any command
+              if (cmd_len > 4'd0) begin
+                // Store incoming data byte based on position
+                case (initial_cmd_len)
+                    4'd1: cmd_data[7:0] <= din;
+                    4'd2: if (cmd_len == 2) cmd_data[15:8] <= din; else cmd_data[7:0] <= din;
+                    4'd3: if (cmd_len == 3) cmd_data[23:16] <= din; else if (cmd_len == 2) cmd_data[15:8] <= din; else cmd_data[7:0] <= din;
+                    4'd4: if (cmd_len == 4) cmd_data[31:24] <= din; else if (cmd_len == 3) cmd_data[23:16] <= din; else if (cmd_len == 2) cmd_data[15:8] <= din; else cmd_data[7:0] <= din;
+                    4'd8:
+                        case(cmd_len)
+                            4'd8: cmd_data[63:56] <= din;
+                            4'd7: cmd_data[55:48] <= din;
+                            4'd6: cmd_data[47:40] <= din;
+                            4'd5: cmd_data[39:32] <= din;
+                            4'd4: cmd_data[31:24] <= din;
+                            4'd3: cmd_data[23:16] <= din;
+                            4'd2: cmd_data[15:8] <= din;
+                            4'd1: cmd_data[7:0] <= din;
+                          default: ;
+                        endcase
+                    default: ; // Should not happen
+                endcase
+
+                // Decrement counter
+                cmd_len <= cmd_len - 4'd1;
+
+                // If this was the last byte (cmd_len==1), we'll execute the command next cycle
+                if (cmd_len == 4'd1) begin
+`ifdef DEBUG_ADB
+                  $display("ADB CMD: Stored final byte din=0x%02h, will execute next cycle", din);
+`endif
+                end
+              end
+              // If cmd_len is 0, this means we stored all bytes last cycle
+              // Now execute the completed command
+              else begin
+                $display("ADB_EXEC: cmd=%02h cmd_len=%0d din=%02h cmd_data=%016x", cmd, cmd_len, din, cmd_data);
+`ifdef DEBUG_ADB
+                $display("ADB CMD COMPLETE: cmd=0x%02h cmd_data=%016x", cmd, cmd_data);
+`endif
+                state <= IDLE;
+                cmd <= 8'h00;  // Clear cmd for next command
+                data <= 32'h00000008;  // Restore SRQ status for IDLE reads
+
+                case (cmd)
+                  8'h04: begin adb_mode <= din | adb_mode; end
+                  8'h05: begin adb_mode <= adb_mode & ~din; end
+                  8'h06: begin
+                    // SET_CONFIG (0x06) - Configure ADB parameters (3 bytes)
+                    // Byte 2: mouse_ctl_addr, kbd_ctl_addr
+                    // Byte 1: (reserved)
+                    // Byte 0: repeat_info
+                    mouse_ctl_addr <= {4'd0, cmd_data[23:20]};
+                    kbd_ctl_addr   <= {4'd0, cmd_data[19:16]};
+                    repeat_info    <= cmd_data[7:0];
+
+                    // Recalculate VBL timing values immediately
+                    repeat_delay_vbl <= delay_to_vbl_count(cmd_data[6:4]);
+                    repeat_rate_vbl <= rate_to_vbl_count(cmd_data[3:0], 1'b0);
+                  end
+                  8'h07: begin
+                    // SYNC (0x07) - Multi-byte command, process all data at once
+                    if (initial_cmd_len == 4'd4) begin // ROM1
+                      adb_mode       <= cmd_data[31:24];
+                      mouse_ctl_addr <= {4'd0, cmd_data[23:20]};
+                      kbd_ctl_addr   <= {4'd0, cmd_data[19:16]};
+                      repeat_info    <= cmd_data[7:0];
+
+                      // Recalculate VBL timing values
+                      repeat_delay_vbl <= delay_to_vbl_count(cmd_data[6:4]);
+                      repeat_rate_vbl <= rate_to_vbl_count(cmd_data[3:0], (cmd_data[31:24] & 8'h08) != 8'h00);
+                    end else begin // ROM3 (8 bytes)
+                      adb_mode       <= cmd_data[63:56];
+                      mouse_ctl_addr <= {4'd0, cmd_data[55:52]};
+                      kbd_ctl_addr   <= {4'd0, cmd_data[51:48]};
+                      repeat_info    <= cmd_data[39:32];
+                      char_set       <= cmd_data[23:16];
+                      layout         <= cmd_data[15:8];
+
+                      // Recalculate VBL timing values
+                      repeat_delay_vbl <= delay_to_vbl_count(cmd_data[38:36]);
+                      repeat_rate_vbl <= rate_to_vbl_count(cmd_data[35:32], (cmd_data[63:56] & 8'h08) != 8'h00);
+                    end
+                  end
+                  8'h08: begin
+                    // WRITE_MEM - Write byte to ADB controller memory (2 bytes)
+                    // cmd_data[15:8] = address (single byte, 0-255)
+                    // din = value to write
+                    // Based on gsplus: only addresses < 0x100 are writable (RAM)
+`ifdef DEBUG_ADB
+                    $display("ADB WRITE_MEM: addr=0x%02h value=0x%02h", cmd_data[15:8], din);
+`endif
+                    if (cmd_data[15:8] < 8'h60) begin  // Only first 96 bytes are actual RAM
+                      ram_addr <= cmd_data[15:8];
+                      ram_din <= din;
+                      ram_wen <= 1'b1;
+                    end else begin
+`ifdef DEBUG_ADB
+                      $display("ADB WRITE_MEM: addr 0x%02h out of range, ignoring", cmd_data[15:8]);
+`endif
+                    end
+                  end
+                  8'h09: begin
+                    // READ_MEM - Handled in CMD state execution block (runs when cmd_len==0)
+                    // This is just a placeholder to show the command exists
+                  end
+                  8'h11: ; // send keycode data
+                  8'h12: ; // cmd 12 - ROM3 only
+                  8'h13: ; // cmd 13 - ROM3 only
+                  default: begin
+                    // Check if this is a device LISTEN command that needs data
+                    if (cmd >= 8'h10) begin
+                      if (cmd[1:0] == 2'b10) begin // LISTEN command
+                        if (device_present[cmd[7:4]]) begin
+                          // Store data in device register (Byte 1 is data, Byte 0 is unused)
+                          device_registers[cmd[7:4]][cmd[3:2]] <= cmd_data[15:8];
+                        end
+                      end
+                    end
+                  end
+                endcase
+              end
+            end
+
+            DATA: begin
+              // Write received while in DATA state - this happens when ROM finishes
+              // reading data and immediately starts a new command. Process as new command.
+              // The state transition to IDLE happens via non-blocking assignment, but
+              // we may detect the write before it takes effect. Handle it here.
+`ifdef DEBUG_ADB
+              $display("ADB WRITE in DATA state: din=0x%02h - treating as new command", din);
+`endif
+              // Force transition to IDLE and start new command
+              state <= IDLE;
+              pending_data <= 3'd0;
+              cmd_response_ready <= 1'b0;
+              c026_status_read_with_data <= 1'b0;
+              data_last_byte_read <= 1'b0;
+
+              // Process as new command (same as IDLE state)
+              cmd <= din;
+              cmd_timeout <= 16'd0;
+              cmd_data <= 64'd0;
+              initial_cmd_len <= 4'd0;
+              case (din)
+                8'h01: begin
+                  ps2_key_held <= 1'b0;
+                  repeat_vbl_target <= 16'd0;
+                end
+                8'h03: begin
+                  ps2_key_held <= 1'b0;
+                  repeat_vbl_target <= 16'd0;
+                  kbd_fifo_head <= 4'd0;
+                  kbd_fifo_tail <= 4'd0;
+                  kbd_fifo_count <= 4'd0;
+                  kbd_strobe <= 1'b0;
+                  valid_kbd <= 1'b0;
+                end
+                8'h04: begin cmd_len <= 4'd1; initial_cmd_len <= 4'd1; state <= CMD; end
+                8'h05: begin cmd_len <= 4'd1; initial_cmd_len <= 4'd1; state <= CMD; end
+                8'h06: begin cmd_len <= 4'd3; initial_cmd_len <= 4'd3; state <= CMD; end
+                8'h07: begin
+                  cmd_len <= (VERSION < 6) ? 4'd4 : 4'd8;
+                  initial_cmd_len <= (VERSION < 6) ? 4'd4 : 4'd8;
+                  state <= CMD;
+                end
+                8'h08: begin cmd_len <= 4'd2; initial_cmd_len <= 4'd2; state <= CMD; end
+                8'h09: begin
+                  cmd_len <= 4'd2; initial_cmd_len <= 4'd2; state <= CMD;
+`ifdef DEBUG_ADB
+                  $display("ADB CMD 0x09 (READ_MEM) from DATA state: Transitioning to CMD state, cmd_len=2");
+`endif
+                end
+                8'h0a: begin
+                  data <= { 24'd0, adb_mode };
+                  pending_data <= 3'd1;
+                  state <= DATA;  // Go directly to DATA state
+                end
+                8'h0b: begin
+                  data <= {
+                    {mouse_ctl_addr[3:0], kbd_ctl_addr[3:0]},
+                    repeat_info,
+                    char_set,
+                    layout
+                  };
+                  pending_data <= 3'd4;
+                  state <= DATA;  // Go directly to DATA state
+                end
+                8'h0d: begin
+                  data <= {24'd0, VERSION[7:0]};
+                  pending_data <= 3'd1;
+                  state <= DATA;  // Go directly to DATA state
+                end
+                default: begin
+                  if (din >= 8'h10) begin
+                    case (din[1:0])
+                      2'b01: begin
+                        cmd_response_ready <= 1'b1;
+                        pending_data <= 3'd0;
+                      end
+                      2'b10: begin
+                        if (device_present[din[7:4]]) begin
+                          cmd_len <= 4'd2;
+                          initial_cmd_len <= 4'd2;
+                          state <= CMD;
+                        end else begin
+                          cmd_response_ready <= 1'b1;
+                          pending_data <= 3'd0;
+                        end
+                      end
+                      2'b11: begin
+                        if (device_present[din[7:4]]) begin
+                          if (din[7:4] == 4'd2 && din[3:2] == 2'd3) begin
+                            data <= { 16'd0, 8'h02, 8'h07 };
+                            pending_data <= 3'd2;
+                          end else if (din[7:4] == 4'd3 && din[3:2] == 2'd3) begin
+                            data <= { 16'd0, 8'h01, 8'h63 };
+                            pending_data <= 3'd2;
+                          end else begin
+                            data <= { 24'd0, device_registers[din[7:4]][din[3:2]] };
+                            pending_data <= 3'd1;
+                          end
+                          cmd_response_ready <= 1'b1;
+                        end
+                      end
+                      default: ;
+                    endcase
+                  end
+                end
+              endcase
+            end
+            default: ;
+          endcase
+        end else if (strobe) begin
+`ifdef DEBUG_ADB
+          $display("ADB_MODULE_WR_C026: cen=%b strobe=%b din=%02h [BLOCKED - CEN NOT HIGH]", cen, strobe, din);
+`endif
+        end
+      end
+
+      8'h27: begin
+        // $C027 - ADB Control Register
+        if (rw) begin
+          // Read $C027 - Status bits
+          // bit 7: Mouse Data register full (valid_mouse_data) OR command response ready
+          // bit 6: Mouse interrupt enable
+          // bit 5: Data register contains valid data (pending_data)
+          // bit 4: Data interrupt enable
+          // bit 3: Keyboard data valid
+          // bit 2: Keyboard interrupt enable
+          // bit 1: Mouse coordinate flag (0=X next, 1=Y next)
+          // bit 0: Command full
+          // bit 7 (MOUSE_DATA) is mouse-data-only. It must NOT reflect a pending
+          // command/keyboard response: the ROM IRQ dispatcher (FF:BE31..BE3D)
+          // reads $C027 and treats bit7&bit6 as "mouse interrupt", so a command
+          // response (pending_data>0) or kbd SRQ leaking into bit7 makes the
+          // firmware misroute every ADB IRQ to the mouse handler and never drain
+          // the keyboard SRQ -> wedge. gsplus sets bit7 from mouse data only and
+          // signals response data via bit5 (DATA_VALID) instead.
+          // bit 5 (DATA_VALID) reflects a command response OR a pending keyboard
+          // SRQ so the firmware knows there's a byte to read at $C026 (gsplus:
+          // DATA_VALID set when interrupt_byte!=0 or data_pending>0).
+          dout <= {
+            valid_mouse_data,      // bit 7: mouse data valid ONLY
+            mouse_int,             // bit 6: mouse interrupt enable
+            (pending_data > 0) | kbd_srq_pending | desk_mgr_pending,  // bit 5: valid data (cmd response, SRQ byte, or Ctrl-OA-Esc desk-mgr)
+            data_int,              // bit 4: data interrupt enable
+            valid_kbd,             // bit 3: keyboard data valid
+            kbd_int,               // bit 2: keyboard interrupt enable
+            mouse_coord,           // bit 1: mouse coordinate flag
+            cmd_full               // bit 0: command full
+          };
+`ifdef DEBUG_ADB
+          if (strobe && valid_mouse_data) begin
+            $display("C027 READ: mouse_valid=1 mouse_coord=%b -> 0x%02h",
+                     mouse_coord,
+                     {valid_mouse_data | (pending_data > 0), mouse_int, pending_data > 0 ? 1'b1 : 1'b0, data_int, valid_kbd, kbd_int, mouse_coord, cmd_full});
+          end
+`endif
+        end else if (cen & strobe) begin
+          // Write $C027 - Interrupt enables
+          mouse_int <= din[6];
+          data_int <= din[4];
+          kbd_int <= din[2];
+        end
+      end
+
+      // Apple IIe keyboard compatibility registers
+      8'h00: begin  // $C000 - Keyboard data
+        if (rw) begin
+          dout <= K;  // Return current key with strobe bit
+
+          // GSplus-style key repeat: generate repeat on $C000 READ
+          // Only trigger on RISING edge of strobe to prevent multiple repeats per bus cycle
+          if (strobe && !strobe_prev && !K[7] && ps2_key_held && held_iie_char != 8'hFF && repeat_delay_vbl != 8'd0) begin
+            if ($signed(hz60_count - repeat_vbl_target) >= 0) begin
+              K <= {1'b1, held_iie_char[6:0]};
+              c025[3] <= 1'b1;
+              repeat_vbl_target <= hz60_count + {8'd0, repeat_rate_vbl};
+`ifdef DEBUG_VERBOSE
+              $display("ADB REPEAT: char=%02h at hz60=%d next_target=%d", held_iie_char, hz60_count, hz60_count + {8'd0, repeat_rate_vbl});
+`endif
+            end
+          end
+        end
+      end
+      
+      8'h10: begin  // $C010 - Keyboard strobe clear (ANY access clears strobe)
+        if (rw) begin
+          dout <= K;  // Return K value on read
+        end
+        // Clear strobe on ANY access (read or write) - matches GSplus behavior
+        if (cen & strobe & !c010_processed_this_strobe) begin
+`ifdef DEBUG_ADB
+          $display("ADB C010 WRITE PROCESSED (cen=%b, strobe=%b) - processing C010 clear", cen, strobe);
+          $display("ADB C010: K before clear = %02h, fifo_count=%d", K, kbd_fifo_count);
+`endif
+          c010_processed_this_strobe <= 1'b1;  // Mark that we processed C010 this strobe transaction
+          K <= {1'b0, K[6:0]};  // Clear strobe bit
+          kbd_strobe <= 1'b0;  // Clear ADB strobe
+          c025[3] <= 1'b0;  // Clear repeat function flag (GSplus: g_c025_val &= ~0x08)
+
+          // Advance FIFO to next character
+          if (kbd_fifo_count > 0) begin
+            kbd_fifo_tail <= (kbd_fifo_tail + 4'd1) & 4'd7;  // MAX_KBD_BUF-1 mask
+            kbd_fifo_count <= kbd_fifo_count - 1'd1;
+
+            // Load next character if available (kbd_fifo_count > 1 means there's another after this one)
+            if (kbd_fifo_count > 1) begin
+              // Convert next FIFO entry to Apple IIe ASCII
+              reg [7:0] next_char;
+              next_char = adb_to_apple_iie_ascii(
+                kbd_fifo[(kbd_fifo_tail + 1) % MAX_KBD_BUF][6:0],
+                shift_down, ctrl_down, caps_lock_state
+              );
+
+              // Load next character - duplicates are allowed (e.g., "tt")
+              K <= {1'b1, next_char[6:0]};
+              kbd_strobe <= 1'b1;
+`ifdef DEBUG_ADB
+              $display("ADB C010: Loaded next FIFO char=%02h", next_char);
+`endif
+            end
+          end
+        end else if (cen & strobe & c010_processed_this_strobe) begin
+`ifdef DEBUG_ADB
+          $display("ADB C010 WRITE REJECTED - already processed this strobe transaction (cen=%b, strobe=%b)", cen, strobe);
+`endif
+        end
+      end
+      
+      // Paddle/Joystick registers (stub)
+      8'h60, 8'h61, 8'h62, 8'h63: begin
+        dout <= 8'd0;
+      end
+
+      8'h64, 8'h65, 8'h66, 8'h67: begin
+        dout <= 8'd0;
+      end
+
+      8'h24: begin
+        // $C024 - Mouse Data Register (read-only)
+        // Returns X delta then Y delta on alternating reads
+        // Format: bit 7 = button state (inverted) for Y, always 1 for X
+        //         bits 6:0 = signed delta value (-63 to +63)
+        if (rw) begin
+          // Combinational read output (no strobe needed)
+          if (valid_mouse_data) begin
+            if (mouse_coord) begin
+              dout <= device_registers[3][0];  // Y + button
+            end else begin
+              dout <= device_registers[3][1];  // X + always-1-bit
+            end
+          end else begin
+            // No new mouse data - return appropriate "no movement" value
+            if (mouse_coord) begin
+              // Y byte: last known button state, no delta
+              dout <= {device_registers[3][0][7], 7'b0000000};
+            end else begin
+              // X byte: bit7 always 1, no delta
+              dout <= 8'h80;
+            end
+          end
+
+          // Mark that C024 was read this strobe cycle (for falling edge handling)
+          if (strobe) begin
+            c024_was_read <= 1'b1;
+          end
+        end
+      end
+
+      default: dout <= 8'd0;
+    endcase
+
+    // Handle C024 mouse_coord toggle on falling edge of strobe
+    // This must be outside the case block because by the time strobe falls,
+    // the address may have already changed to something else
+    if (~strobe & strobe_prev & c024_was_read) begin
+      if (valid_mouse_data) begin
+        if (mouse_coord) begin
+          // After reading Y, clear valid flag and reset coord
+          valid_mouse_data <= 1'b0;
+          mouse_coord <= 1'b0;
+`ifdef DEBUG_ADB
+          $display("C024 READ Y: 0x%02h (btn=%d, dy=%d)",
+                   device_registers[3][0], ~device_registers[3][0][7],
+                   $signed({device_registers[3][0][6], device_registers[3][0][6:0]}));
+`endif
+        end else begin
+          // After reading X, toggle coord for next Y read
+          mouse_coord <= 1'b1;
+`ifdef DEBUG_ADB
+          $display("C024 READ X: 0x%02h (dx=%d)",
+                   device_registers[3][1],
+                   $signed({device_registers[3][1][6], device_registers[3][1][6:0]}));
+`endif
+        end
+      end else begin
+        // Toggle coord even when no data (maintains alternating pattern)
+        mouse_coord <= ~mouse_coord;
+      end
+      c024_was_read <= 1'b0;  // Clear the flag after handling
+    end
+
+    // Clear c024_was_read on falling edge even if it wasn't set (belt and suspenders)
+    if (~strobe & strobe_prev) begin
+      c024_was_read <= 1'b0;
+    end
+
+    // IDLE->DATA transition: on the strobe FALLING edge after the response
+    // header was read (flag set in the C026 IDLE read block). Doing this on the
+    // falling edge guarantees the CPU has already latched the header byte, and
+    // is robust to phi2/strobe-edge alignment (the rising-edge+cen approach
+    // could miss, stranding the response). Mirrors the C024 falling-edge handler.
+    if (~strobe & strobe_prev & c026_status_read_with_data) begin
+      state <= DATA;
+      cmd_response_ready <= 1'b0;
+      c026_status_read_with_data <= 1'b0;
+`ifdef DEBUG_ADB
+      $display("ADB C026 HEADER->DATA (falling): pending=%d data=%08h", pending_data, data);
+`endif
+    end
+
+    // Clear cmd_response_ready when no pending data (after status byte was read)
+    // This handles the case where there's no data to return after the status byte
+    if (~strobe & strobe_prev & cmd_response_ready & (pending_data == 3'd0) & (state == IDLE)) begin
+      cmd_response_ready <= 1'b0;
+    end
+
+    // Ctrl-OA-Esc desk-mgr byte (0x20): clear desk_mgr_pending on the strobe
+    // FALLING edge, AFTER the CPU has latched the combinational dout_comb=0x20.
+    // (Clearing on the rising edge raced the CPU read -> it latched 0x00 and the
+    // ROM ADB IRQ handler at FF:BE67 never saw the desk-mgr bit, so the Control
+    // Panel never opened.) Mirrors the c026_status_read_with_data handler above.
+    if (~strobe & strobe_prev & deskmgr_read_with_pending) begin
+      desk_mgr_pending <= 1'b0;
+      deskmgr_read_with_pending <= 1'b0;
+`ifdef DEBUG_DESKMGR
+      $display("DESKMGR: 0x20 consumed on strobe falling edge -> desk_mgr_pending cleared");
+`endif
+    end
+
+    // Update edge detection register on every cycle
+    strobe_prev <= strobe;
+    rw_prev <= rw;  // Track read/write transitions
+
+    // Note: removed noisy ADB_STATE_TRACK debug output
+  end
+end
+
+endmodule

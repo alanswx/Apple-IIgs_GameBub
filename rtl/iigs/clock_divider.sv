@@ -1,0 +1,651 @@
+// Define DEBUG_CLKDIV to enable verbose clock divider debug output
+//`define DEBUG_CLKDIV
+// Define DEBUG_SLOWMEM to enable slowMem access tracking (very verbose)
+//`define DEBUG_SLOWMEM
+
+module clock_divider (
+    input  wire        clk_14M,        // 14.318 MHz input clock
+    input  wire        reset,          // Active high reset
+    input  wire [7:0]  cyareg,          // Active high reset
+    input wire [7:0] bank,             // CPU BANK
+    input wire [7:0] shadow,           // SHADOW REG
+    input wire [15:0] addr,            // CPU ADDR
+    input wire IO,
+    input wire we,                     // Write enable signal
+    input wire valid,                  // VPA|VDA: bus cycle is valid (address bus meaningful)
+    input wire is_rom_access,          // True when accessing ROM (refresh hidden)
+
+    // Fast-cycle length in CLK_14M ticks minus one (accelerator speed step).
+    // 4 = native 5-tick / 2.864 MHz; 3 = 3.58; 2 = 4.77; 1 = 7.16; 0 = 14.32.
+    // Only the FAST cycle shortens: slow (1 MHz) and sync (I/O, E0/E1,
+    // shadowed-video writes) cycles are untouched, like a real ZipGS/TWGS.
+    input  wire [3:0]  fast_thresh,
+
+    // Bus-master DMA in progress (HDD): DMA data paths are registered and
+    // tuned for the native 5-tick cycle, so DMA cycles always run at native
+    // pace regardless of the accelerator step (the CPU is held anyway).
+    input  wire        dma_active,
+
+    // External-slot access ($C100-$C7FF slot card space, mmu slot_ce). When
+    // accelerated these drop to a sync (1 MHz) cycle like a real ZipGS with
+    // its default slot-delay configuration; at native they stay fast exactly
+    // as before.
+    input  wire        slot_access,
+
+    // 1 = the ZipGS register file is unlocked: $C058-$C05F accesses are the
+    // accelerator's own registers and respond at full speed on a real card
+    // (the Zip CDA's speed measurement polls $C05B in a tight loop; classifying
+    // those reads as 1 MHz I/O makes it report ~1.2 MHz however fast the
+    // machine runs). While locked they are the annunciators and keep their
+    // authentic sync timing.
+    input  wire        zipregs_fast,
+
+    input  wire        stretch,        // Stretch signal for extended cycles
+
+    // 5.25" drive-enable holdover. The IWM keeps /ENBL asserted for ~1 s after
+    // the motor-off switch ($C0E8) when mode bit 2 is clear, and the FPI's
+    // slot-6 motor-on detect follows that enable, not the bare soft switch --
+    // so the machine stays at 1 MHz for the spin-down second. Programs rely on
+    // it: Bouncing Kamungas touches $C0E8 and then reads the whole sector at
+    // Apple II timing while the disk coasts. Same model as Clemens
+    // (clem_iwm_speed_disk_gate on CLEM_IWM_FLAG_DRIVE_ON + drive_hold_ns).
+    // Driven by iwm_woz's IWM_ENBL (iwm_active) gated to the 5.25" bus (!DISK35);
+    // with mode bit 2 set (no holdover) it drops with the switch, as on hardware.
+    input  wire        disk_motor_hold,
+
+    // PH0 phase/edge from the VGC/Mega II video timebase (video_timing.v).
+    // ph0_phase_vid = hsub (0..13, the PH0 sub-char phase); ph0_stb_vid pulses
+    // at the first pixel of each Mega II char (the PH0 boundary). Used to slave
+    // CPU PH0/SYNC alignment to the beam.
+    // NOTE: connected but not yet consumed (Stage 1 = wiring only).
+    input  wire [3:0]  ph0_phase_vid,
+    input  wire        ph0_stb_vid,
+    // Line-boundary strobe from video_timing (hcount wrap, where hsub/hidx
+    // realign and V increments). Used to anchor the CPU PH0 grid to the beam:
+    // once locked it coincides with the natural 65th-PH0 long-cycle wrap
+    // (both timebases are 912 ticks/line), so it only corrects the boot-time
+    // phase offset; PH0 periods stay regular afterwards.
+    input  wire        line_stb_vid,
+
+    // Clock enables (active high for one 14M cycle)
+    output reg         clk_14M_en,     // 14M enable (always high)
+    output reg         clk_7M_en,      // 7M enable (~7.159 MHz)
+    output reg         ph0_en,         // PH0 enable (~1 MHz, compatible with Apple II)
+    output wire        ph2_en,         // PH2 enable (variable rate for fast/sync cycles) (FAST CLK)
+    output reg         q3_en,          // Q3 enable (quadrature timing)
+    
+    // Clock states for debugging/interfacing
+    output reg         ph0_state,      // Current PH0 level
+    output reg         slow,             // Slow mode indicator
+    output reg         slowMem/*verilator public_flat*/             // Slow mode indicator
+);
+
+// Clock divider counters
+reg [3:0]  clk_14M_counter;    // 14M cycle counter
+reg [3:0]  ph0_counter;        // PH0 cycle counter (0-13 for full cycle)
+reg [3:0]  ph2_counter;        // PH2 cycle counter
+
+// Effective fast threshold: DMA cycles always run at the native pace
+// (registered DMA data paths need the 5-tick window).
+wire [3:0] eff_thresh_now = dma_active ? 4'd4 : fast_thresh;
+
+// Latched at each (gated) PH2 fire -- the SAME edge where the top level
+// latches its datapath select (Apple-IIgs.sv `if (phi2) accel_r <= ...`), so
+// the cycle length and the read-path selection always change as a matched
+// pair and a mid-cycle fast_thresh change (IWM hold-off expiry, HDD-DMA end,
+// $C05D/OSD write) can never SHORTEN the in-flight cycle. Without this, a
+// hold-off expiry mid-cycle snaps the fire compare to the accelerated value
+// while accel_r is still native: the following reads run 1-tick cycles
+// through the never-stalling ch3 path, whose nat_data register is cold
+// during accelerated running -- stale bytes with no stall. Caught by the
+// SDRAM_SIM coherency checker (stale ROM fetch right after a boot
+// floppy-scan hold-off at --speed 4; the 14.3 MHz GS/OS boot corruption).
+// Reset value = native.
+reg [3:0] eff_thresh = 4'd4;
+always @(posedge clk_14M) begin
+    if (reset)       eff_thresh <= 4'd4;
+    else if (ph2_en) eff_thresh <= eff_thresh_now;
+end
+
+// Combinational mirror of the registered slowMem classification below (keep
+// the two in sync; this one uses `we` where the registered one uses we_reg).
+// Purpose: at accelerated speeds a 2-tick fast cycle ends on the SAME edge
+// the registered slowMem lands, so a slow-classified access would complete
+// as a fast cycle before it can be rerouted to a sync cycle (observed as the
+// slot-7 HDD C7xx ROM probe reading stale bytes at 7.16 MHz). The fast-fire
+// path holds while this is set until the registered slowMem takes over. At
+// the native 5-tick cycle the decision point is 3 ticks after registration,
+// so the hold can never trigger and native timing is bit-identical.
+// $C058-$C05F while the Zip registers are unlocked: on-card, full speed
+wire zipreg_access = zipregs_fast && (addr[15:3] == 13'b1100000001011);
+
+wire slow_class_now = valid && !zipreg_access && (
+     (slot_access && fast_thresh != 4'd4) ||
+     (bank == 8'hE0 || bank == 8'hE1) ||
+     ( (bank == 8'h00 || bank == 8'h01) && addr[15:8] == 8'hC0 && !shadow[6] &&
+       !(
+         (addr == 16'hC02D && !we) ||
+         (addr == 16'hC035) ||
+         (addr == 16'hC036) ||
+         (addr == 16'hC037) ||
+         (addr == 16'hC068 && !we) ||
+         (addr >= 16'hC071 && addr <= 16'hC07F)
+       )
+     ) ||
+     (we && (bank == 8'h00 || bank == 8'h01) &&
+        (
+            (addr >= 16'h0400 && addr <= 16'h07FF && ~shadow[0]) ||
+            (addr >= 16'h0800 && addr <= 16'h0BFF && ~shadow[5]) ||
+            (addr >= 16'h2000 && addr <= 16'h3FFF && ~shadow[1] && !(bank == 8'h01 && shadow[4])) ||
+            (addr >= 16'h4000 && addr <= 16'h5FFF && ~shadow[2] && !(bank == 8'h01 && shadow[4])) ||
+            (addr >= 16'h2000 && addr <= 16'h9FFF && bank == 8'h01 && ~shadow[3])
+        )
+     ));
+reg [3:0]  refresh_counter;    // Refresh cycle counter (every 9th cycle)
+reg        cycle_is_refresh;   // Next cycle is a refresh (10-tick) cycle
+reg        clk_7M_div;         // 7M divider flip-flop
+reg [3:0]  ph2_gap_count;      // Ticks since last ph2_en (for debug tracking)
+reg [6:0]  scanline_ph0_ctr;   // PH0 cycles since scanline start (0..64); 65 PH0 cycles per scanline
+reg        fast_stretch;       // NTSC per-scanline stretch pending: add 2 ticks to the next fast cycle
+
+// Pipeline registers for clean PH2/PH0 synchronization (Option 3)
+reg [3:0] ph0_counter_next;     // Next cycle ph0_counter value (for enable calculation)
+reg       we_reg;              // Registered version of we signal to avoid timing races
+
+// PH0-to-beam anchoring is ON by default: the real FPI recreates PH0 from
+// 14M+STRETCH to match the Mega II PH0, i.e. the CPU PH0
+// grid is phase-locked to the video beam. Overridable for A/B: +ph0_anchor=0.
+reg        ph0_anchor_en;
+// --- Debug/experiment knobs (sim-only, plusarg-gated, no-op by default) ---
+// +cpu_knob=N   : stall the CPU N 14M-ticks on the slow->fast base transition
+// +ph0_dbg=1    : print CPU-PH0 vs video-PH0 phase at slowMem sync fires
+reg [15:0] cpu_knob_val, knob_stall;
+reg        prev_slow_base;
+reg        ph0_dbg_en;
+reg [15:0] ph0_dbg_cnt;
+`ifdef SIMULATION
+integer knob_tmp, anchor_tmp, dbg_tmp;
+initial begin
+    knob_tmp = 0; anchor_tmp = 1; dbg_tmp = 0;
+    void'($value$plusargs("cpu_knob=%d", knob_tmp));
+    void'($value$plusargs("ph0_anchor=%d", anchor_tmp));
+    void'($value$plusargs("ph0_dbg=%d", dbg_tmp));
+    cpu_knob_val  = knob_tmp[15:0];
+    ph0_anchor_en = (anchor_tmp != 0);
+    ph0_dbg_en    = (dbg_tmp != 0);
+    ph0_dbg_cnt   = 16'd0;
+end
+`else
+// FPGA: anchor always on, debug knobs off (power-up register init)
+initial begin
+    ph0_anchor_en = 1'b1;
+    cpu_knob_val  = 16'd0;
+    ph0_dbg_en    = 1'b0;
+    ph0_dbg_cnt   = 16'd0;
+end
+`endif
+
+
+
+// CYAREG:
+//
+// 0 - slot 4 disk motor-on detect
+// 1 - slot 5 disk motor-on detect
+// 2 - slot 6 disk motor-on detect
+// 3 - slot 7 disk motor-on detect
+// 4 - shadowing enabled all ram banks
+// 5 - RESERVED DO NOT MODIFY
+// 6 - POWER ON STATUS
+// 7 - CPU Speed (0 - 1.024Mhz 1 - 2.8Mhz )
+// 
+//
+// When bit 1 is set, on C0D9 access switch to 1.024Mhz on  C0D8 resume to 2.8Mhz
+// C0C9 - slot 4
+// C0D9 - slot 5
+// C0E9 - slot 6
+// C0F9 - slot 7
+
+// Shadowed writes slow down processor
+
+reg waitforC0C8;
+reg waitforC0D8;
+reg waitforC0E8;
+reg waitforC0F8;
+
+always @(posedge clk_14M) begin
+    if (reset) begin
+    end else begin
+    end
+end
+
+// Slow mode: CYAREG bit 7 = 0, OR waiting for slot motor-on detect WITH cyareg bit enabled
+// Note: 3.5" floppy motor does NOT force slow mode - only 5.25" slot-based detection does
+// MAME gates slow mode by (m_motors_active & (m_speed & 0x0f)), so we do the same:
+// - waitforC0XY tracks motor state unconditionally
+// - cyareg[N] bit gates whether that motor forces slow mode
+// A real ZipGS/TWGS overrides the motherboard speed switch: with the
+// accelerator engaged the CPU runs fast regardless of $C036 bit 7 (CYAREG[7]).
+// Software slows the machine through the Zip's own registers or by disabling
+// the card, NOT by clearing CYAREG[7]. This matters beyond cosmetics — the
+// Zip CDA's speed self-test literally clears CYAREG[7] before measuring
+// (expecting the card to stay fast), and any title that briefly drops to
+// 1 MHz via $C036 would otherwise lose acceleration. accel_active is
+// (fast_thresh != native); when native the term is unchanged, so the default
+// machine is bit-identical.
+wire accel_active = (fast_thresh != 4'd4);
+
+// --- 1-tick fast-escape guard (14.32 MHz step) ---
+// ph2_en is a REGISTERED enable: the pulse that completes a CPU cycle is
+// decided at the edge BEFORE that cycle's address is valid. At >=2-tick fast
+// cycles the slow_class_now fire-hold (fast branch below) reroutes a
+// slow-classified access in time, but at the 1-tick step there is no spare
+// edge -- the enable is already high when the address appears, so the first
+// access of every slow run (I/O, E0/E1, shadowed write, slot) would complete
+// as a 69ns fast cycle (wrong Mega II sync timing, stale data from
+// registered-output devices). Suppress the pulse combinationally in that
+// window; the access stays uncommitted (CPU CE low), the registered slowMem
+// then reroutes it to a proper sync cycle. Provably a no-op at native
+// (accel_active=0) and at 2..5-tick steps (there the fire-hold already
+// prevents ph2_en_r from rising while slow_class_now is set, so the gate
+// never sees a 1 to suppress).
+reg  ph2_en_r;
+// Note: keyed off the LATCHED eff_thresh (not live fast_thresh) so the gate
+// agrees with the cycle length actually in effect for the current cycle.
+wire fast_escape = (eff_thresh != 4'd4) && !dma_active && !slow && !slowMem && slow_class_now;
+assign ph2_en = ph2_en_r & ~fast_escape;
+
+wire slow_request = (cyareg[7] == 1'b0 && !accel_active) ||
+                   (waitforC0C8 && cyareg[0]) ||
+                   (waitforC0D8 && cyareg[1]) ||
+                   ((waitforC0E8 || disk_motor_hold) && cyareg[2]) ||
+                   (waitforC0F8 && cyareg[3]);
+
+`ifdef DEBUG_VERBOSE
+// Debug: track previous states and counters (module scope to avoid
+// procedural declarations errors in Verilog-2001 tools)
+reg        prev_slow;
+reg        prev_slowMem;
+reg [31:0] slow_ph2_cnt;
+reg [31:0] fast_ph2_cnt;
+reg [31:0] slow_14m_cycles;
+reg [31:0] fast_14m_cycles;
+reg [3:0]  last_event; // 0:none 1:C0C9 2:C0D9 3:C0E9 4:C0F9 5:C042 6:slowMem
+// Track previous motor flag states for edge detection
+reg        prev_waitforC0C8;
+reg        prev_waitforC0D8;
+reg        prev_waitforC0E8;
+reg        prev_waitforC0F8;
+reg [15:0] iwm_slow_log_count;
+`endif
+	
+always @(posedge clk_14M) begin
+    if (reset) begin
+        waitforC0C8 <= 1'b0;
+        waitforC0D8 <= 1'b0;
+        waitforC0E8 <= 1'b0;
+        waitforC0F8 <= 1'b0;
+`ifdef DEBUG_VERBOSE
+        prev_waitforC0C8 <= 1'b0;
+        prev_waitforC0D8 <= 1'b0;
+        prev_waitforC0E8 <= 1'b0;
+        prev_waitforC0F8 <= 1'b0;
+`endif
+    end else begin
+        // Track motor state UNCONDITIONALLY (like MAME does)
+        // The cyareg bits gate whether motor forces slow mode (in slow_request), not tracking
+
+        if (IO && addr == 16'hC0C9) begin
+            waitforC0C8 <= 1;
+        end
+        if (IO && addr == 16'hC0D9) begin
+            waitforC0D8 <= 1;
+        end
+        if (IO && addr == 16'hC0E9) begin
+            waitforC0E8 <= 1;
+        end
+        if (IO && addr == 16'hC0F9) begin
+            waitforC0F8 <= 1;
+        end
+
+        if (waitforC0C8 && IO && addr == 16'hC0C8) begin
+            waitforC0C8 <= 0;
+        end
+        if (waitforC0D8 && IO && addr == 16'hC0D8) begin
+            waitforC0D8 <= 0;
+        end
+        if (waitforC0E8 && IO && addr == 16'hC0E8) begin
+            waitforC0E8 <= 0;
+        end
+        if (waitforC0F8 && IO && addr == 16'hC0F8) begin
+            waitforC0F8 <= 0;
+        end
+
+`ifdef DEBUG_VERBOSE
+        // Edge-detected debug output for motor state changes
+`ifdef DEBUG_CLKDIV
+        if (waitforC0C8 && !prev_waitforC0C8)
+            $display("VSIM_MOTOR: slot=4 motor=ON  (waitforC0C8=0->1) cyareg[0]=%0d t=%0t", cyareg[0], $time);
+        if (!waitforC0C8 && prev_waitforC0C8)
+            $display("VSIM_MOTOR: slot=4 motor=OFF (waitforC0C8=1->0) cyareg[0]=%0d t=%0t", cyareg[0], $time);
+        if (waitforC0D8 && !prev_waitforC0D8)
+            $display("VSIM_MOTOR: slot=5 motor=ON  (waitforC0D8=0->1) cyareg[1]=%0d t=%0t", cyareg[1], $time);
+        if (!waitforC0D8 && prev_waitforC0D8)
+            $display("VSIM_MOTOR: slot=5 motor=OFF (waitforC0D8=1->0) cyareg[1]=%0d t=%0t", cyareg[1], $time);
+        if (waitforC0E8 && !prev_waitforC0E8)
+            $display("VSIM_MOTOR: slot=6 motor=ON  (waitforC0E8=0->1) cyareg[2]=%0d t=%0t", cyareg[2], $time);
+        if (!waitforC0E8 && prev_waitforC0E8)
+            $display("VSIM_MOTOR: slot=6 motor=OFF (waitforC0E8=1->0) cyareg[2]=%0d t=%0t", cyareg[2], $time);
+        if (waitforC0F8 && !prev_waitforC0F8)
+            $display("VSIM_MOTOR: slot=7 motor=ON  (waitforC0F8=0->1) cyareg[3]=%0d t=%0t", cyareg[3], $time);
+        if (!waitforC0F8 && prev_waitforC0F8)
+            $display("VSIM_MOTOR: slot=7 motor=OFF (waitforC0F8=1->0) cyareg[3]=%0d t=%0t", cyareg[3], $time);
+`endif
+        prev_waitforC0C8 <= waitforC0C8;
+        prev_waitforC0D8 <= waitforC0D8;
+        prev_waitforC0E8 <= waitforC0E8;
+        prev_waitforC0F8 <= waitforC0F8;
+`endif
+    end
+end
+
+always @(posedge clk_14M) begin
+    if (reset) begin
+        // Reset all counters and states
+        clk_14M_counter <= 4'd0;
+        ph0_counter <= 4'd0;
+        ph2_counter <= 4'd0;
+        refresh_counter <= 4'd0;
+        cycle_is_refresh <= 1'b0;
+        clk_7M_div <= 1'b0;
+        
+        // Reset enables
+        clk_14M_en <= 1'b0;
+        clk_7M_en <= 1'b0;
+        ph0_en <= 1'b0;
+        ph2_en_r <= 1'b0;
+        q3_en <= 1'b0;
+        
+        // Reset states
+        ph0_state <= 1'b0;
+        slow <= 1'b0;
+        slowMem <= 1'b0;
+        
+        // Reset pipeline registers
+        we_reg <= 1'b0;
+        ph2_gap_count <= 4'd0;
+        scanline_ph0_ctr <= 7'd0;
+        fast_stretch <= 1'b0;
+        knob_stall <= 16'd0;
+        prev_slow_base <= 1'b0;
+`ifdef DEBUG_VERBOSE
+        prev_slow <= 1'b0;
+        prev_slowMem <= 1'b0;
+        slow_ph2_cnt <= 32'd0;
+        fast_ph2_cnt <= 32'd0;
+        slow_14m_cycles <= 32'd0;
+        fast_14m_cycles <= 32'd0;
+        last_event <= 4'd0;
+        iwm_slow_log_count <= 16'd0;
+`endif
+        
+        // Reset pipeline registers (duplicate for safety)
+    end else begin
+        // --- Refactored Logic ---
+        slow <= slow_request;
+
+        // Register write enable to avoid timing races
+        we_reg <= we;
+
+        // 4. Determine slowMem (only when bus cycle is valid)
+        // During internal CPU cycles (VPA=VDA=0), address bus is invalid;
+        // internal cycles are always fast (no memory access occurring).
+        slowMem <= 1'b0;
+        if ( valid && !zipreg_access && (
+             (slot_access && fast_thresh != 4'd4) ||
+             (bank == 8'hE0 || bank == 8'hE1) ||
+             ( (bank == 8'h00 || bank == 8'h01) && addr[15:8] == 8'hC0 && !shadow[6] &&
+               // IOLC shadow gate: $C0xx in banks 00/01 is real I/O (slow) only when
+               // I/O+LanguageCard shadowing is enabled (shadow[6]=0). When inhibited
+               // (shadow[6]=1) it is plain fast RAM and must not incur a SYNC penalty.
+               // Matches gssquared is_iolc_shadowed(); normal operation has shadow[6]=0.
+               !(
+                 (addr == 16'hC02D && !we_reg) ||   // Slot ROM Select: read-fast, write-slow
+                 (addr == 16'hC035) ||               // Shadow register: always fast
+                 (addr == 16'hC036) ||               // Speed register: always fast
+                 (addr == 16'hC037) ||               // DMA register: always fast
+                 (addr == 16'hC068 && !we_reg) ||    // State register: read-fast, write-slow
+                 (addr >= 16'hC071 && addr <= 16'hC07F)  // Interrupt ROM: always fast
+               )
+             ) ||
+             (we_reg && (bank == 8'h00 || bank == 8'h01) &&
+                (
+                    // Shadow bits are "inhibit" flags: bit=0 means shadow ENABLED (slow access)
+                    // bit=1 means shadow DISABLED (fast access). Use inverted bits for slowMem.
+                    (addr >= 16'h0400 && addr <= 16'h07FF && ~shadow[0]) ||                              // Text 1
+                    (addr >= 16'h0800 && addr <= 16'h0BFF && ~shadow[5]) ||                              // Text 2
+                    (addr >= 16'h2000 && addr <= 16'h3FFF && ~shadow[1] && !(bank == 8'h01 && shadow[4])) || // HiRes 1
+                    (addr >= 16'h4000 && addr <= 16'h5FFF && ~shadow[2] && !(bank == 8'h01 && shadow[4])) || // HiRes 2
+                    (addr >= 16'h2000 && addr <= 16'h9FFF && bank == 8'h01 && ~shadow[3])                // SHR (bank 01)
+                )
+             )
+           ))
+        begin
+            slowMem <= 1;
+`ifdef DEBUG_SLOWMEM
+            if (bank == 8'hE0 || bank == 8'hE1)
+                $display("SLOWMEM: bank_E0E1 bank=%02x addr=%04x t=%0t", bank, addr, $time);
+            else if ((bank == 8'h00 || bank == 8'h01) && addr[15:12] == 4'hC)
+                $display("SLOWMEM: IO_space bank=%02x addr=%04x t=%0t", bank, addr, $time);
+            else if (we_reg)
+                $display("SLOWMEM: shadow_wr bank=%02x addr=%04x shadow=%02x t=%0t", bank, addr, shadow, $time);
+`endif
+        end
+
+        // --- Original Clock Generation Logic (unchanged) ---
+
+        // 14M is always enabled
+        clk_14M_en <= 1'b1;
+        
+        // Increment master counter
+        clk_14M_counter <= clk_14M_counter + 1'b1;
+        
+        // Generate 7M enable (every other 14M cycle)
+        clk_7M_div <= ~clk_7M_div;
+        clk_7M_en <= ~clk_7M_div;  // Enable on rising edge of 7M
+        
+        // PH0 generation (Apple II compatible 1MHz clock).
+        // NTSC line stretch: a normal PH0 is 14 ticks (wrap at 13); the LAST (65th)
+        // PH0 of each scanline is a 16-tick "long cycle" (wrap at 15) so the CPU
+        // scanline = 64*14 + 16 = 912 ticks. Because slow-mode CPU cycles are gated
+        // by this PH0, this keeps the CPU locked to the 912-tick video line in SLOW
+        // mode too (the vsync spin), eliminating the per-frame drift that wobbled
+        // $C02F by 1 char. (Fast-mode cycles are not PH0-gated, so they still use the
+        // fast_stretch +2 below; the two are mutually exclusive per line by speed.)
+        if (ph0_anchor_en && line_stb_vid) begin
+            // Beam line boundary: (re)anchor the CPU PH0 grid to the video
+            // timebase. Once locked this fires on the SAME tick as the natural
+            // 65th-PH0 long-cycle wrap below (both timebases are 912 ticks per
+            // line), so after the one-time boot phase correction it is a
+            // structural no-op and PH0 periods stay perfectly regular.
+            ph0_counter_next = 4'd0;
+            scanline_ph0_ctr <= 7'd0;
+            if (!slow && !slowMem) fast_stretch <= 1'b1;
+        end else if (ph0_counter == ((scanline_ph0_ctr == 7'd64) ? 4'd15 : 4'd13)) begin
+            ph0_counter_next = 4'd0;
+            if (scanline_ph0_ctr == 7'd64) begin
+                scanline_ph0_ctr <= 7'd0;
+                // In fast mode, stretch a fast CPU cycle (+2). In slow/sync mode the
+                // 16-tick long PH0 above already supplies the stretch -> don't double.
+                if (!slow && !slowMem) fast_stretch <= 1'b1;
+            end else begin
+                scanline_ph0_ctr <= scanline_ph0_ctr + 7'd1;
+            end
+        end else begin
+            ph0_counter_next = ph0_counter + 1'b1;
+        end
+        ph0_counter <= ph0_counter_next;
+
+        if (ph0_counter_next < 4'd7) begin
+            ph0_state <= 1'b0;
+            ph0_en <= (ph0_counter_next == 4'd0);
+        end else begin
+            ph0_state <= 1'b1;
+            ph0_en <= 1'b0;
+        end
+        
+        q3_en <= (ph0_counter_next == 4'd0) || (ph0_counter_next == 4'd7);
+        
+
+        // Track gap since last ph2_en (for mode transition safety)
+        if (ph2_en)
+            ph2_gap_count <= 4'd0;
+        else if (ph2_gap_count < 4'd14)
+            ph2_gap_count <= ph2_gap_count + 4'd1;
+
+	if (slow==1'b1) begin
+		// Pure slow mode (C036[7]=0): every cycle runs at PHI0 rate (1.023 MHz)
+		// Fire ph2_en on every PHI0 boundary.
+		if (ph0_counter_next == 4'd0) begin
+			ph2_en_r <= 1'b1;
+			ph2_counter <= 4'd0;
+			// Refresh cadence counts this slow cycle too (hidden here); see the
+			// slowMem note above.
+			if (refresh_counter >= 4'd8)
+				refresh_counter <= 4'd0;
+			else
+				refresh_counter <= refresh_counter + 4'd1;
+			cycle_is_refresh <= 1'b0;
+		end else begin
+			ph2_en_r <= 1'b0;
+			ph2_counter <= 4'd0;
+		end
+	end else if (slowMem==1'b1) begin
+		// Sync cycle per krue FPI doc: extend PH2 to overlap one full PH0 cycle.
+		// Total cycle = 14-27 ticks (2 low + 12-25 high).
+		// Fire ph2_en at first PH0 falling edge where total cycle >= 14 ticks,
+		// ensuring one complete PH0 period is contained within PH2 high.
+		// ph2_counter tracks elapsed ticks since cycle start (inherited from
+		// fast path, keeps counting through sync).
+		if (ph2_counter < 4'd15)
+			ph2_counter <= ph2_counter + 4'd1;
+
+		if (ph0_counter_next == 4'd0 && ph2_counter >= 4'd13) begin
+			ph2_en_r <= 1'b1;
+			ph2_counter <= 4'd0;
+			// +ph0_dbg=1: CPU-PH0 vs beam-PH0 phase at each sync fire
+			// (locked = equal; historical bug = phase_vid == ph0_counter+8 mod 14)
+			if (ph0_dbg_en && ph0_dbg_cnt < 16'd300) begin
+				$display("PH0DBG: ph0_ctr=%0d phase_vid=%0d scanline_ctr=%0d",
+				         ph0_counter, ph0_phase_vid, scanline_ph0_ctr);
+				ph0_dbg_cnt <= ph0_dbg_cnt + 16'd1;
+			end
+			// RAM refresh is every 9th PH2 cycle (FPI). It is HIDDEN (no speed
+			// loss) in a sync/slow-bus cycle, but the sync cycle still COUNTS
+			// toward the cadence -- so a sync-heavy fast blit (e.g. textfunk's
+			// shadowed-write beam-race) still gets the right number of fast-RAM
+			// refresh cycles, keeping each screen-row block at exactly 912 clocks.
+			if (refresh_counter >= 4'd8)
+				refresh_counter <= 4'd0;   // 9th cycle: refresh absorbed by this sync
+			else
+				refresh_counter <= refresh_counter + 4'd1;
+			cycle_is_refresh <= 1'b0;
+		end else begin
+			ph2_en_r <= 1'b0;
+		end
+	end else begin
+        // Fast mode with RAM refresh penalty:
+        // Every 9th fast RAM cycle takes 10 ticks instead of 5.
+        // ROM access hides refresh (stays at full 2.8636 MHz).
+        ph2_counter <= ph2_counter + 1'b1;
+
+        if (cycle_is_refresh) begin
+            // Refresh cycle: 10 ticks (12 if it absorbs the per-scanline NTSC stretch)
+            if (ph2_counter >= (fast_stretch ? 4'd11 : 4'd9)) begin
+                ph2_counter <= 4'd0;
+                ph2_en_r <= 1'b1;
+                cycle_is_refresh <= 1'b0;
+                refresh_counter <= 4'd0;
+                fast_stretch <= 1'b0;       // stretch consumed
+            end else begin
+                ph2_en_r <= 1'b0;
+            end
+        end else begin
+            // Normal fast cycle: eff_thresh+1 ticks (5 at native), +2 if it
+            // absorbs the per-scanline NTSC stretch. DMA always native pace.
+            // At accelerated speeds, hold the fire while the current access
+            // classifies slow (slow_class_now) so the registered slowMem can
+            // reroute it to a sync cycle — see the comment at slow_class_now.
+            if (ph2_counter >= (fast_stretch ? (eff_thresh + 4'd2) : eff_thresh)
+                && !(slow_class_now && eff_thresh != 4'd4)) begin
+                ph2_counter <= 4'd0;
+                ph2_en_r <= 1'b1;
+                fast_stretch <= 1'b0;       // stretch consumed
+                // Decide next cycle:
+                if (is_rom_access) begin
+                    refresh_counter <= 4'd0;    // ROM hides refresh
+                    cycle_is_refresh <= 1'b0;
+                end else if (refresh_counter >= 4'd8 && fast_thresh == 4'd4) begin
+                    // RAM-refresh penalty models the FPI's DRAM refresh steal and
+                    // only applies at the native 5-tick cycle. Accelerated steps
+                    // model a ZipGS/TWGS-style cache in front of RAM, which hides
+                    // refresh (and the accelerated timing is not FPI-authentic
+                    // anyway).
+                    cycle_is_refresh <= 1'b1;   // Next is refresh (10-tick)
+                    refresh_counter <= 4'd0;
+                end else begin
+                    refresh_counter <= refresh_counter + 4'd1;
+                    cycle_is_refresh <= 1'b0;
+                end
+            end else begin
+                ph2_en_r <= 1'b0;
+            end
+        end
+    end
+
+        // +cpu_knob=N debug stall: on the slow->fast base-speed transition,
+        // hold the CPU N 14M ticks (ph2_en low, ph2_counter frozen). Beam-race
+        // lead calibration only; no-op at N=0. Must stay in this live path
+        // (NOT inside DEBUG_VERBOSE).
+        prev_slow_base <= slow;
+        if (prev_slow_base && !slow && cpu_knob_val != 16'd0)
+            knob_stall <= cpu_knob_val;
+        if (knob_stall != 16'd0) begin
+            knob_stall <= knob_stall - 16'd1;
+            ph2_en_r <= 1'b0;
+            ph2_counter <= ph2_counter;
+        end
+
+`ifdef DEBUG_VERBOSE
+        if ((slow != prev_slow) || (slowMem != prev_slowMem)) begin
+`ifdef DEBUG_CLKDIV
+            // Match MAME format for easy comparison
+            $display("VSIM_SPEED: %s -> %s (cyareg=%02x cyareg7=%0d motors=%04b wC0C8=%0d wC0D8=%0d wC0E8=%0d wC0F8=%0d) t=%0t",
+                     prev_slow ? "SLOW" : "FAST",
+                     slow ? "SLOW" : "FAST",
+                     cyareg, cyareg[7],
+                     {waitforC0F8, waitforC0E8, waitforC0D8, waitforC0C8},
+                     waitforC0C8, waitforC0D8, waitforC0E8, waitforC0F8, $time);
+`endif
+            if (!slow && !slowMem) begin
+                slow_ph2_cnt <= 0;
+                slow_14m_cycles <= 0;
+                last_event <= 0;
+            end
+            prev_slow <= slow;
+            prev_slowMem <= slowMem;
+        end
+
+`ifdef DEBUG_VERBOSE
+        if (ph2_en && IO && addr == 16'hC0EC && iwm_slow_log_count < 16'd5000) begin
+            $display("CLKDIV_IWM_SLOW: addr=%04x bank=%02x IO=%0d we=%0d slow=%0d slowMem=%0d slow_req=%0d cyareg=%02x slot_gate=%01x wC0C8=%0d wC0D8=%0d wC0E8=%0d wC0F8=%0d",
+                     addr, bank, IO, we_reg, slow, slowMem, slow_request, cyareg, cyareg[3:0],
+                     waitforC0C8, waitforC0D8, waitforC0E8, waitforC0F8);
+            iwm_slow_log_count <= iwm_slow_log_count + 1'd1;
+        end
+`endif
+`endif
+    end
+end
+
+
+endmodule

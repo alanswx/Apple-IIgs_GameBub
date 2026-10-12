@@ -1,0 +1,5 @@
+rtl/iigs/ is imported by scripts/import_iigs.py - do not edit it by hand.
+Change the MiSTer source (or the patches in the script) and re-import.
+
+source: ../Apple-IIgs_MiSTer
+commit: bf80e6d99c7a9c831f0d7be7436a96486ee48d56

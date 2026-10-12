@@ -1,0 +1,3050 @@
+//============================================================================
+//  Apple IIgs -- system integration: memory controller, I/O and soft switches
+//
+//  Copyright (c) Pierre Cornier
+//  Copyright (c) Steven A. Wilson
+//  Copyright (c) Alan Steremberg
+//
+//  This program is free software; you can redistribute it and/or modify it
+//  under the terms of the GNU General Public License as published by the Free
+//  Software Foundation; either version 3 of the License, or (at your option)
+//  any later version.
+//
+//  This program is distributed in the hope that it will be useful, but WITHOUT
+//  ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+//  FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
+//  more details.
+//
+//  You should have received a copy of the GNU General Public License along
+//  with this program. If not, see <https://www.gnu.org/licenses/>.
+//============================================================================
+
+// Define DEBUG_BANK to enable verbose bank/memory debug output
+// `define DEBUG_BANK
+
+// Define DEBUG_RESET to enable verbose reset/init debug output
+// `define DEBUG_RESET
+
+// Define DEBUG_IO to enable verbose I/O switch debug output
+// `define DEBUG_IO
+
+// Define DEBUG_IRQ to enable verbose interrupt debug output
+// `define DEBUG_IRQ
+
+// Define DEBUG_FLOATBUS to log floating-bus reads ($C05A, Zip locked) with the
+// beam position -- for vaporlock / floating-bus video accuracy work.
+// `define DEBUG_FLOATBUS
+
+// Define DEBUG_FBSPOT to log FLOATBUS test spot-check results (mode, failing
+// spot index, and the actual captured byte) for floating-bus accuracy work.
+// `define DEBUG_FBSPOT
+
+module iigs
+  (
+   input              reset,
+   input              cold_reset,  // 1 = cold/power-on reset (CYAREG bit 6 = 1), 0 = warm reset
+
+   input              CLK_28M,
+   input              CLK_14M,
+   input              clk_vid,
+   input              ce_pix,
+   input [32:0]       timestamp,
+
+  output [7:0] R,
+  output [7:0] G,
+  output [7:0] B,
+  output HBlank,
+  output VBlank,
+  output HS,
+  output VS,
+
+  output [15:0] AUDIO_L,
+  output [15:0] AUDIO_R,
+
+  output phi2,
+  output phi0,
+  output clk_7M,
+
+  // fastram sdram
+  output [23:0] top_addr,
+  output[1:0]  rom_bankaddr,
+  output [7:0] top_dout,
+  input  [7:0] top_din,
+  output       we,
+  output       fastram_ce,
+  output       rom_ce,
+  input        rom_select,  // 0=ROM3, 1=ROM1
+
+ // ps2 alternative interface.
+ // [8] - extended, [9] - pressed, [10] - toggles with every press/release
+ input [10:0] ps2_key,
+ // [24] - toggles with every event
+//
+//always @(posedge clk) if (clk_en) mstb <= ps2_mouse[24];
+//wire       mouseStrobe = mstb ^ ps2_mouse[24];
+//wire [8:0] mouseX = {ps2_mouse[4], ps2_mouse[15:8]};
+//wire [8:0] mouseY = {ps2_mouse[5], ps2_mouse[23:16]};
+//wire       button = ps2_mouse[0];
+
+ input [24:0] ps2_mouse,
+ 
+   // Self-test mode override
+ input              selftest_override,
+
+   // Host (MiSTer OSD / simulator --speed) CPU speed control. Shares state
+   // with the ZipGS $C058-$C05F software interface (see rtl/zipgs_regs.sv):
+   // 0 = native 2.86 MHz (accelerator off), 1 = 3.58, 2 = 4.77, 3 = 7.16,
+   // 4 = 14.32 MHz.
+   input [2:0]        host_speed,
+
+   // 1 = the memory path can sustain accelerated fast cycles (simulator BRAM,
+   // or FPGA ACCEL_SDRAM burst+cache build). 0 = clamp the machine to native
+   // regardless of what the OSD or ZipGS software requests: the plain
+   // single-word SDRAM path cannot complete a fetch inside a 2-tick cycle,
+   // and an un-stalled miss is silent corruption. The ZipGS registers still
+   // respond (like a real Zip with the acceleration jumper disabled).
+   input              accel_capable,
+
+   // 1 = the ZipGS $C058-$C05F software interface is present (OSD
+   // "Accelerator > Card: ZipGS"). 0 = no Zip: the unlock sequence is ignored
+   // and the registers never overlay the annunciators, but host_speed above
+   // still works -- an OSD-only turbo with no software-visible footprint.
+   input              zip_regs_en,
+
+   // OSD views of the accelerator compatibility-delay enables. These are
+   // edge-applied into the ZipGS registers (zipgs_regs host_* inputs), which
+   // are the single source of truth the slowdown windows key off — so the OSD
+   // and the Zip Control Panel stay in sync (either can flip them). With the
+   // TWGS card selected the windows are forced on (a real TransWarp's
+   // slowdowns are automatic and non-configurable).
+   input              osd_spkr_delay,  // $C05C bit 0 (speaker)
+   input              osd_pdl_delay,   // $C059 bit 6 (joystick/paddle)
+   input              osd_ctr_delay,   // $C059 bit 4 (video counter)
+   input              osd_cps_follow,  // $C059 bit 3 (CPS follow)
+   input              osd_irq_delay,   // AppleTalk/IRQ delay (Zip $C059.5 / TWGS $BC0000.3)
+   input              osd_twgs_gfx,    // TWGS Startup Graphics (NVRAM word2 bit2)
+   input              osd_twgs_snd,    // TWGS Startup Sound    (NVRAM word2 bit3)
+
+   // 1 = present a TransWarp GS card in bank $BC (OSD "Accelerator > Card"): ROM
+   // signature/JSL API at $BC8000, $BC0000 control latch, X2444 NVRAM. Rides
+   // the same speed engine as ZipGS. 0 = absent (bank $BC untouched).
+   input              twgs_present,
+
+   // Live accelerator configuration, for the OSD status write-back mirror:
+   // the speed the selected card is configured for (ignores CYAREG gating)
+   // and the delay-enable register bits. The top level pushes these into the
+   // MiSTer status word when software changes them.
+   output [2:0]       accel_cfg_speed,
+   output             accel_spkr_delay,
+   output             accel_pdl_delay,
+   output             accel_ctr_delay,
+   output             accel_cps_follow,
+   output             accel_irq_delay,
+   output             accel_twgs_gfx,
+   output             accel_twgs_snd,
+
+   // NVRAM backup port (MiSTer SD slot 4).
+   // 512-byte block: [0-255]=PRAM, [256-287]=TWGS X2444, rest reads $FF.
+   input  [8:0]       nv_addr,
+   input              nv_wr,
+   input  [7:0]       nv_din,
+   output [7:0]       nv_dout,
+
+   // 1 = fast cycles are currently configured (by the OSD or by ZipGS
+   // software). The FPGA top selects the CPU read datapath with this:
+   // native -> single-word registered reads (cycle-exact, never stalls),
+   // fast -> burst+cache with stall-on-miss.
+   output             accel_active,
+
+   // Memory-path stall (ACCEL_SDRAM cache miss in flight). Gated into the CPU
+   // RDY so a fill that cannot meet the current cycle's data deadline holds
+   // the CPU for whole ph2_en periods instead of letting it sample stale
+   // data. Tie 0 when the memory path always meets the native deadline.
+   input              mem_stall,
+
+   // HDD DMA in progress (bus owned by the DMA engine, CPU held). Exposed for
+   // the simulation's SDRAM-path coherency checker; may be left unconnected.
+   output             dbg_hdd_dma,
+
+   // Floppy write-protect (sim global)
+ input              floppy_wp,
+   
+   // Joystick and paddle inputs
+   input [31:0]       joystick_0,
+   input [31:0]       joystick_1,
+   input [15:0]       joystick_l_analog_0,
+   input [15:0]       joystick_l_analog_1,
+   input [7:0]        paddle_0,
+   input [7:0]        paddle_1,
+   input [7:0]        paddle_2,
+   input [7:0]        paddle_3,
+
+ 
+   // HDD control (supports 2 units - ProDOS limit)
+  output [15:0] HDD_SECTOR,
+  output [1:0]  HDD_READ,
+  output [1:0]  HDD_WRITE,
+  input [1:0]   HDD_MOUNTED,
+  input         img_readonly,
+  input [63:0]  img_size,
+  input [8:0]   HDD_RAM_ADDR,
+  input [7:0]   HDD_RAM_DI,
+  output [7:0]  HDD_RAM_DO,
+  input         HDD_RAM_WE,
+  input [1:0]   HDD_ACK,
+
+   // --- WOZ bit interface for 3.5" drive 1 ---
+   output [7:0]       WOZ_TRACK3,           // Track number being read
+   output [15:0]      WOZ_TRACK3_BIT_ADDR,  // Byte address in track bit buffer (16-bit for FLUX tracks)
+   output             WOZ_TRACK3_STABLE_SIDE, // Stable side for data reads (captured when motor starts)
+   input  [7:0]       WOZ_TRACK3_BIT_DATA,  // Byte from track bit buffer
+   input  [31:0]      WOZ_TRACK3_BIT_COUNT, // Total bits in track
+   input              WOZ_TRACK3_READY,     // Track data valid for current WOZ_TRACK3
+   input              WOZ_TRACK3_DATA_VALID, // BRAM data valid for selected side (no state check)
+   input              WOZ_TRACK3_LOAD_COMPLETE, // Pulses when track load finishes (reset bit_position)
+   input              WOZ_TRACK3_IS_FLUX,   // Track data is flux timing (not bitstream)
+   input  [31:0]      WOZ_TRACK3_FLUX_SIZE, // Size in bytes of flux data (when IS_FLUX)
+   input  [31:0]      WOZ_TRACK3_FLUX_TOTAL_TICKS, // Sum of FLUX bytes for timing normalization
+   input              WOZ_TRACK3_WP,        // Write-protected flag from WOZ INFO chunk
+   output [7:0]       WOZ_TRACK3_BIT_DATA_IN, // Write byte to BRAM
+   output             WOZ_TRACK3_BIT_WE,      // Write enable
+   output [15:0]      WOZ_TRACK3_BIT_WR_ADDR, // Write address (latched)
+
+   // --- WOZ bit interface for 5.25" drive 1 ---
+   output [5:0]       WOZ_TRACK1,           // Track number being read
+   output [8:0]       WOZ_TRACK1_QTRACK,    // Full quarter-track head position (half-track seeks)
+   input              WOZ_TRACK1_DATA_VALID, // BRAM data matches the requested 5.25" track
+   output [15:0]      WOZ_TRACK1_BIT_ADDR,  // Byte address in track bit buffer (16-bit for FLUX)
+   input  [7:0]       WOZ_TRACK1_BIT_DATA,  // Byte from track bit buffer
+   input  [31:0]      WOZ_TRACK1_BIT_COUNT, // Total bits in track
+   input              WOZ_TRACK1_LOAD_COMPLETE, // Pulses when 5.25" track load finishes
+   input              WOZ_TRACK1_IS_FLUX,       // Track data is flux timing (not bitstream)
+   input      [7:0]   WOZ_525_BIT_TIMING,       // WOZ INFO byte 39 for the 5.25" disk (0 = standard)
+   input  [31:0]      WOZ_TRACK1_FLUX_SIZE,     // Size in bytes of flux data
+   input  [31:0]      WOZ_TRACK1_FLUX_TOTAL_TICKS, // Sum of FLUX bytes for timing normalization
+   input              WOZ_TRACK1_WP,            // Write-protected flag from WOZ INFO chunk
+   output [7:0]       WOZ_TRACK1_BIT_DATA_IN,   // Write byte to BRAM
+   output             WOZ_TRACK1_BIT_WE,        // Write enable
+   output [15:0]      WOZ_TRACK1_BIT_WR_ADDR,   // Write address (latched)
+
+   input [3:0]        DISK_READY,
+   input              FLOPPY_WP,
+
+	 output        UART_TXD,
+    input         UART_RXD,
+    output        UART_RTS,
+    input         UART_CTS,
+    input         serial_port_printer,
+
+    // Sim-only: cross-wire SCC channel A<->B (TXD<->RXD) to emulate an
+    // external serial loopback cable (for the diagnostic External Serial test).
+    input         serial_loopback,
+
+   // Floppy motor status (for dirty track flush on motor-off)
+   output             floppy_motor_on,
+   output             floppy35_motor_on,
+   output             drive35_eject_req,
+
+   // Keyboard-triggered reset outputs
+   output        keyboard_reset,      // Ctrl+F11 was pressed - trigger warm reset
+   output        keyboard_cold_reset, // Ctrl+OpenApple+F11 was pressed - trigger cold reset
+
+   // Keyboard LED state for MiSTer HPS PS/2 LED passthrough
+   output        capslock,            // Caps Lock state (1 = Caps Lock on)
+
+   // ZipGS C/D cache-disable ($C059 bit 7): 1 = bypass the SDRAM read cache
+   output        cache_disable
+
+);
+
+   assign top_addr = addr_bus;
+   assign top_dout = dout;
+
+   logic [7:0]       bank;
+   logic [15:0]      addr;
+   logic [7:0]       dout;
+   logic       slowram_ce;
+   logic       rom1_ce/*verilator public_flat*/;
+   logic       rom2_ce/*verilator public_flat*/;
+   logic       romc_ce/*verilator public_flat*/;
+   logic       romd_ce/*verilator public_flat*/;
+   logic [7:0] shadow/*verilator public_flat*/;
+   logic [7:0] TEXTCOLOR;
+   logic [3:0] BORDERCOLOR;
+   logic [7:0] SLTROMSEL;
+   logic [7:0] CYAREG;
+   logic [7:0] DMAREG; // DMA bank register
+   logic reset_prev;  // For detecting reset release
+   logic CXROM;
+   logic       RDROM;
+   logic       LC_WE;
+   logic       LCRAM2;
+   logic       PAGE2/*verilator public_flat*/;
+   logic       TEXTG/*verilator public_flat*/;
+   logic       MIXG/*verilator public_flat*/;
+   logic       HIRES_MODE/*verilator public_flat*/;
+   logic       ALTCHARSET/*verilator public_flat*/;
+   logic       EIGHTYCOL/*verilator public_flat*/;
+   logic       AN3/*verilator public_flat*/;
+   logic [7:0] NEWVIDEO/*verilator public_flat*/;
+   logic IO/*verilator public_flat*/;
+   logic slow/*verilator public_flat*/;
+   logic slowMem/*verilator public_flat*/;
+   logic ph0_state;
+
+   parameter RAMSIZE = 128; // 16x64k = 1MB, max = 127x64k = 8MB
+
+   logic [9:0]        H;
+   logic [8:0]        V/*verilator public_flat*/;
+   logic [8:0]        V_M2;            // Mega II CPU-visible vertical counter ($C02E/$C02F); leads V by the HBL-side 266px (see video_timing H_M2_WRAP)
+   logic [6:0]        H_CHAR/*verilator public_flat*/;  // Mega II horizontal counter ($C02F), per TN.IIGS.039
+   logic [3:0]        PH0_PHASE_VID;   // video PH0 sub-char phase (=hsub) for clock_divider slaving
+   logic              PH0_STB_VID;     // video PH0 boundary strobe (first pixel of each Mega II char)
+   logic              LINE_STB_VID;    // video line-boundary strobe (hcount wrap) for PH0 grid anchoring
+   
+  logic [7:0]         bank_bef;
+  logic [15:0]        addr_bef;
+
+  logic [23:0]        cpu_addr;
+  logic [7:0]         cpu_dout;
+  logic [23:0]        addr_bus /* verilator public_flat */;
+  logic [23:0]        fastram_addr_bus;
+  logic [15:0]        hdd_dma_addr;
+  logic               cpu_vpa, cpu_vpb;
+  logic               cpu_vda, cpu_mlb;
+  logic               cpu_we_n;
+  logic               hdd_dma_we;
+  logic [7:0]         io_dout;
+  logic [7:0]         slot_dout;
+
+  // External slot ROM returns $FF (no card present) - tells ROM to skip this slot
+  assign slot_dout = 8'hFF;
+
+  logic               onesecond_irq;
+  logic               qtrsecond_irq;
+  logic               snd_irq;
+
+  logic               valid;
+
+  logic [7:0]         prtc_din;
+  logic [7:0]         prtc_dout;
+  logic               prtc_addr;
+  logic               prtc_rw, prtc_strobe;
+
+  // Edge-detect for IRQ sources
+  logic               vbl_irq_d;
+  logic               qtr_irq_d;
+
+  logic [7:0]         adb_din;
+  logic [7:0]         adb_dout;
+  logic [7:0]         adb_addr;
+  logic               adb_rw, adb_strobe;
+
+  logic [7:0]         iwm_dout;
+
+  logic               iwm_strobe;
+
+  // Slot HDD handled externally in top.v; no internal state here
+
+  logic [7:0]         snd_din;
+  logic [7:0]         snd_dout;
+  logic [1:0]         snd_addr;
+  logic               snd_rw, snd_strobe;
+
+  // SCC (Serial Communications Controller) signals
+  logic [7:0]         scc_din;
+  logic [7:0]         scc_dout;
+  logic [7:0]         scc_dout_reg;
+  logic               scc_cs;
+  logic               scc_we;
+  logic [1:0]         scc_rs;
+  logic               scc_irq_n;
+  logic               scc_rd_active; // one-shot read strobe helper
+
+  logic               aux;
+
+  // some fake registers for now
+  //logic [7:0] NEWVIDEO;
+  //logic [7:0]         CYAREG;
+  logic [7:0]         SOUNDDATA;
+  //logic [7:0] SLTROMSEL;
+  logic [7:0]         SOUNDADRL;
+  logic [7:0]         SOUNDADRH;
+  //logic [7:0] TEXTCOLOR;
+  //logic ;
+  logic               speaker_state;  // Apple II speaker toggle state
+  logic [7:0]         DISK35;
+  // floppy_motor_on is now a module output (for clock slowdown + dirty track flush)
+  wire iwm_enbl;  // IWM /ENBL state incl. motor-off holdover (feeds clock_divider slow mode)
+  logic [7:0]         C02BVAL;
+
+  logic [7:0]         VGCINT; //23
+  logic [7:0]         INTEN; //41
+  reg [7:0]           INTFLAG = 0; // 46, 47 - Interrupt flags register
+
+  logic               STORE80;
+  logic               RAMRD;
+  logic               RAMWRT;
+  logic               INTCXROM;
+  logic               ALTZP;
+  logic               SLOTC3ROM;
+  //logic               EIGHTYCOL;
+  //logic               ALTCHARSET;
+  //logic PAGE2;
+  //logic RDROM;
+  //logic LCRAM2;
+  //logic LC_WE;
+  logic               ROMBANK;
+
+  logic               LC_WE_PRE;
+
+  logic inhibit_cxxx;
+
+  //logic TEXTG;
+  //logic MIXG;
+
+
+  // remap c700 to c500 if slot access and $C02D[7]
+  //assign addr_bus =
+  // slot_area && cpu_addr[15:8] == 8'b11000111 ? { cpu_addr[23:10], ~SLTROMSEL[7], cpu_addr[8:0] } : cpu_addr;
+
+
+  logic               EXTERNAL_IO;
+
+  logic               rom_writethrough;
+
+  logic               lcram2_sel;
+
+  // Legacy Mega II VBL status bit for $C019
+  wire                mega2_vbl;
+
+  assign CXROM=INTCXROM;
+  assign { bank, addr } = addr_bus;
+
+  assign dout = (hdd_dma & hdd_dma_we) ? HDD_DO :
+                (hdd_dma & ~hdd_dma_we) ? cpu_din :
+                cpu_dout;
+
+  assign we = hdd_dma ? hdd_dma_we : ~cpu_we_n;
+  assign valid = cpu_vpa | cpu_vda;
+  
+  // φ2 is a clock ENABLE, not a clock - always use CLK_14M as clock
+
+  wire slowram_we;
+
+  // IWM device select ($C0E0-$C0EF)
+  wire iwm_device_select = IO & (cpu_addr[7:4] == 4'hE);
+
+  // Debug: IOLC inhibit testing
+  always @(posedge CLK_14M) begin
+    if (phi2 && addr_bef[15:8] == 8'hC0 && (bank_bef == 8'h00 || bank_bef == 8'h01) && shadow[6]) begin
+      $display("IOLC_DEBUG: bank=%02x addr=%04x we=%b IO=%b fastram_ce=%b shadow=%02x din=%02x cpu_din=%02x",
+               bank_bef, addr_bef, we, IO, fastram_ce, shadow, din, cpu_din);
+    end
+  end
+
+  // Combinational ADB read detection - bypasses io_dout timing issue for ADB reads
+  // ADB addresses: $C000, $C010, $C024, $C025, $C026, $C027, $C044, $C045
+  // NOTE: $C064-$C067 are paddle timer reads, $C070 is paddle trigger - NOT ADB
+  wire adb_read = IO & ~we & (
+    addr_bef[7:0] == 8'h00 |  // $C000 - Keyboard data
+    addr_bef[7:0] == 8'h10 |  // $C010 - Keyboard strobe
+    addr_bef[7:0] == 8'h24 |  // $C024 - Mouse data
+    addr_bef[7:0] == 8'h25 |  // $C025 - Modifier keys
+    addr_bef[7:0] == 8'h26 |  // $C026 - ADB command/data
+    addr_bef[7:0] == 8'h27 |  // $C027 - ADB status
+    addr_bef[7:0] == 8'h44 |  // $C044 - Mouse X (alternate)
+    addr_bef[7:0] == 8'h45    // $C045 - Mouse Y (alternate)
+  );
+
+  // Use combinational logic but add debug to detect timing issues
+  assign { bank_bef, addr_bef } = hdd_dma ? {DMAREG, hdd_dma_addr} : cpu_addr;
+  
+  // Debug: Track bank changes to detect potential timing issues
+  reg [7:0] prev_bank;
+  always @(posedge CLK_14M) begin
+    if (phi2) begin
+      if (bank_bef != prev_bank && addr_bef == 16'h0600) begin
+        $display("TIMING_DEBUG: Bank changed during $0600 access: %02x -> %02x", 
+                 prev_bank, bank_bef);
+      end
+      prev_bank <= bank_bef;
+    end
+  end
+
+  // ---------------------------------------------------------------------------
+  // MMU: logical -> physical address translation and memory decode.
+  // Pure combinational function of the logical address, R/W direction and
+  // soft-switch state; unit-tested standalone (see vsim/mmu_tb.cpp).
+  // ---------------------------------------------------------------------------
+  mmu #(.RAMSIZE(RAMSIZE)) mmu_inst (
+    .bank_log(bank_bef),
+    .addr_log(addr_bef),
+    .we(we),
+    .vpb_n(cpu_vpb),
+    .rom_select(rom_select),
+
+    .LCRAM2(LCRAM2),
+    .RDROM(RDROM),
+    .LC_WE(LC_WE),
+    .shadow(shadow),
+    .ALTZP(ALTZP),
+    .RAMRD(RAMRD),
+    .RAMWRT(RAMWRT),
+    .STORE80(STORE80),
+    .PAGE2(PAGE2),
+    .HIRES_MODE(HIRES_MODE),
+    .bank_latch(NEWVIDEO[0]),
+    .shadow_all(CYAREG[4]),
+    .SLTROMSEL(SLTROMSEL),
+
+    .dbg_wdata(dout),
+    .dbg_cpu_addr(cpu_addr),
+
+    .addr_bus(addr_bus),
+    .aux(aux),
+    .lcram2_sel(lcram2_sel),
+    .inhibit_cxxx(inhibit_cxxx),
+    .IO(IO),
+    .EXTERNAL_IO(EXTERNAL_IO),
+    .is_internal_io(is_internal_io),
+    .is_internal(is_internal),
+    .fastram_ce(fastram_ce),
+    .slowram_ce(slowram_ce),
+    .slowram_we(slowram_we),
+    .rom1_ce(rom1_ce),
+    .rom2_ce(rom2_ce),
+    .romc_ce(romc_ce),
+    .romd_ce(romd_ce),
+    .slot_ce(slot_ce),
+    .slot_internalrom_ce(slot_internalrom_ce),
+    .rom_writethrough(rom_writethrough)
+  );
+
+
+`ifdef DEBUG_BANK
+  // Local mirrors of mmu-internal decode helpers (debug display use only)
+  wire fastram_ce_int = fastram_ce;
+  wire slowram_ce_int = slowram_ce;
+  wire [3:0] page = addr_bef[15:12];
+  wire txt1_shadow = ~shadow[0] && (page == 4'h0 && addr_bef[11:8] >= 4'h4 && addr_bef[11:8] <= 4'h7);
+
+  // Debug: C034 RTC access tracing (to catch address bus corruption)
+  always @(posedge CLK_14M) begin
+    // Monitor ALL C034 accesses to catch address bus corruption
+    if (addr_bef == 16'hC034) begin
+      $display("C034_ACCESS: addr_bef=%06x bank_bef=%02x addr_bef=%04x we=%b IO=%b data=%02x",
+               addr_bef, bank_bef, addr_bef, we, IO, we ? dout : cpu_din);
+      $display("C034_ADDR_BUS: addr_bus=%06x fastram_addr=%06x", addr_bus, fastram_addr_bus);
+    end
+
+    // Monitor any writes that might be going to wrong addresses
+    if (we && (addr_bef == 16'hC034)) begin
+      $display("C034_WRITE: addr_bef_raw=%06x calculated_addr_bus=%06x data=%02x",
+               addr_bef, addr_bus, dout);
+      if (addr_bef != addr_bus) begin
+        $display("C034_ADDR_MISMATCH: addr_bef=%06x != addr_bus=%06x (CORRUPTION!)",
+                 addr_bef, addr_bus);
+      end
+    end
+
+    // Monitor Bank E1 operations for timing issues
+    if ((bank_bef == 8'hE1) && (we || ~we)) begin
+      $display("BANK_E1_OP: addr=%04x we=%b data=%02x addr_bus=%06x slowram_ce=%b slowram_we=%b slowram_addr=%05x",
+               addr_bef, we, we ? dout : cpu_din, addr_bus, slowram_ce, slowram_we, {bank_bef[0], addr_bef});
+    end
+
+    // Enhanced debug for tool pointer area E1:03C8-03CB (cursor tracking critical)
+    if ((bank_bef == 8'hE1) && (addr_bef >= 16'h03C8) && (addr_bef <= 16'h03CB)) begin
+      $display("TOOL_PTR_DEBUG: addr=E1:%04x we=%b data=%02x slowram_ce=%b slowram_we=%b slowram_dout=%02x cpu_din=%02x dout=%02x",
+               addr_bef, we, we ? dout : slowram_dout, slowram_ce, slowram_we, slowram_dout, cpu_din, dout);
+    end
+
+    // Enhanced debug for cursor position area E1:0190-0193
+    if ((bank_bef == 8'hE1) && (addr_bef >= 16'h0190) && (addr_bef <= 16'h0193)) begin
+      $display("CURSOR_POS_DEBUG: addr=E1:%04x we=%b data=%02x slowram_ce=%b slowram_we=%b slowram_dout=%02x",
+               addr_bef, we, we ? dout : slowram_dout, slowram_ce, slowram_we, slowram_dout);
+    end
+
+    // Watchpoint: catch any write that ends up at slowram address 0x10F3A
+    if (slowram_we && slowram_ce) begin
+      if ({bank[0], addr} == 17'h10F3A) begin
+        $display("CURCYL_WRITE: bank_bef=%02x addr_bef=%04x data=%02x addr_bus=%06x bank=%02x addr=%04x aux=%b cpu_addr=%06x",
+                 bank_bef, addr_bef, cpu_dout, addr_bus, bank, addr, aux, cpu_addr);
+      end
+    end
+
+  end
+
+  // Debug: Clean memory controller verification
+  always @(posedge CLK_14M) begin
+    // Monitor critical $6200 and $0600 range accesses for testing
+    if (addr_bef == 16'h6200 || (addr_bef >= 16'h0600 && addr_bef <= 16'h0610)) begin
+      if (we) begin
+        if (fastram_ce_int && slowram_ce_int) begin
+          $display("REFACTOR_TEST: DUAL_WRITE bank_%02x data=%02x (FASTRAM+SLOWRAM)", bank_bef, dout);
+        end else if (slowram_ce_int) begin
+          $display("REFACTOR_TEST: SLOWRAM_ONLY bank_%02x data=%02x", bank_bef, dout);
+        end else if (fastram_ce_int) begin
+          $display("REFACTOR_TEST: FASTRAM_ONLY bank_%02x data=%02x", bank_bef, dout);
+        end else begin
+          $display("REFACTOR_TEST: NO_RAM_ACCESS bank_%02x data=%02x (ERROR)", bank_bef, dout);
+        end
+      end else begin
+        if (slowram_ce_int) begin
+          $display("REFACTOR_TEST: READ_SLOWRAM bank_%02x (shadowed)", bank_bef);
+        end else if (fastram_ce_int) begin
+          $display("REFACTOR_TEST: READ_FASTRAM bank_%02x (normal)", bank_bef);
+        end else begin
+          $display("REFACTOR_TEST: NO_READ bank_%02x (ERROR)", bank_bef);
+        end
+      end
+      // Debug shadow detection for these critical addresses
+      if (addr_bef >= 16'h0600 && addr_bef <= 16'h0610) begin
+        $display("TXT1_SHADOW_DEBUG: bank_%02x addr=%04x shadow[0]=%b txt1_shadow=%b page=%x addr[11:8]=%x", 
+                 bank_bef, addr_bef, shadow[0], txt1_shadow, page, addr_bef[11:8]);
+      end
+      
+      // Debug memory initialization for Text Page 1 range ($0400-$07FF)
+      if (we && (addr_bef >= 16'h0400 && addr_bef <= 16'h07FF)) begin
+        if (txt1_shadow) begin
+          $display("INIT_DEBUG: TXT1_WRITE bank_%02x addr=%04x data=%02x shadow[0]=%b txt1_shadow=%b -> FASTRAM(00) + SLOWRAM(E0)", 
+                   bank_bef, addr_bef, dout, shadow[0], txt1_shadow);
+        end else begin
+          $display("INIT_DEBUG: TXT1_WRITE bank_%02x addr=%04x data=%02x shadow[0]=%b txt1_shadow=%b -> FASTRAM(00)", 
+                   bank_bef, addr_bef, dout, shadow[0], txt1_shadow);
+        end
+      end
+      
+      // Track writes near $0600 that could cause wraparound overwrites
+      if (we && addr_bef >= 16'h05F8 && addr_bef <= 16'h0608 && addr_bef != 16'h0600) begin
+        $display("0600_NEARBY_WRITE: bank_%02x addr=%04x data=%02x (potential wraparound)", 
+                 bank_bef, addr_bef, dout);
+      end
+      
+      // Track ALL writes to $0600 (including potential overwrites)
+      if (addr_bef == 16'h0600 && we) begin
+        $display("0600_ALL_WRITES: bank_%02x data=%02x addr_bus=%06x fastram_ce=%b slowram_ce=%b", 
+                 bank_bef, dout, addr_bus, fastram_ce_int, slowram_ce_int);
+                 
+        // Memory dump after write - detailed address bus info
+        $display("MEM_DUMP_POST_WRITE: addr_bus=%06x fastram_ce=%b slowram_ce=%b", 
+                 addr_bus, fastram_ce_int, slowram_ce_int);
+      end
+      
+      // Track memory enable signals for debugging
+      if (addr_bef == 16'h0600) begin
+        $display("0600_MEM_CYCLE: we=%b slowram_we=%b slowram_ce_int=%b slowram_ce=%b", 
+                 we, slowram_we, slowram_ce_int, slowram_ce);
+      end
+      
+      // Track specific $0600 pattern writes/reads
+      if (addr_bef == 16'h0600) begin
+        if (we) begin
+          if (txt1_shadow) begin
+            $display("0600_PATTERN_WRITE: bank_%02x data=%02x shadow[0]=%b -> Bank_00 + Bank_E0 (dual write)",
+                     bank_bef, dout, shadow[0]);
+            $display("0600_WRITE_CTRL: fastram_ce=%b slowram_ce=%b addr_bus=%06x", 
+                     fastram_ce_int, slowram_ce_int, addr_bus);
+            $display("0600_WRITE_ADDR: addr_bus=%06x slowram_addr=bank[0]_addr",
+                     addr_bus);
+            $display("0600_WRITE_EN: we=%b slowram_we=%b CLK_14M=%b",
+                     we, slowram_we, CLK_14M);
+            $display("0600_WRITE_TIMING: dout=%02x actual_write_data=%02x", 
+                     dout, dout);
+          end else begin
+            $display("0600_PATTERN_WRITE: bank_%02x data=%02x shadow[0]=%b -> Bank_00", 
+                     bank_bef, dout, shadow[0]);
+            $display("0600_WRITE_CTRL: fastram_ce=%b slowram_ce=%b addr_bus=%06x", 
+                     fastram_ce_int, slowram_ce_int, addr_bus);
+          end
+        end else begin
+          if (bank_bef >= 8'hFC) begin
+            $display("0600_PATTERN_READ: bank_%02x data=%02x shadow[0]=%b <- Bank_00 (ROM->FASTRAM)", 
+                     bank_bef, cpu_din, shadow[0]);
+          end else begin
+            $display("0600_PATTERN_READ: bank_%02x data=%02x shadow[0]=%b <- Bank_00", 
+                     bank_bef, cpu_din, shadow[0]);
+          end
+          
+          // Enhanced read debugging - show exactly where data comes from
+          $display("0600_READ_CTRL: fastram_ce=%b slowram_ce=%b addr_bus=%06x txt1_shadow=%b", 
+                   fastram_ce_int, slowram_ce_int, addr_bus, txt1_shadow);
+          $display("0600_READ_ADDR: addr_bus=%06x slowram_addr=bank[0]_addr",
+                   addr_bus);
+          $display("0600_READ_DATA: cpu_din=%02x top_dout=%02x slowram_data=%02x",
+                   cpu_din, top_dout, slowram_dout);
+          $display("0600_READ_EN: slowram_we=%b mem_clk=%b slowram_ce_actual=%b", 
+                   slowram_we, mem_clk, slowram_ce);
+          $display("0600_READ_MUX: rom1_ce=%b rom2_ce=%b IO=%b data_source=%s", 
+                   rom1_ce, rom2_ce, IO, 
+                   (fastram_ce_int ? "FASTRAM" : (slowram_ce_int ? "SLOWRAM" : (rom1_ce | rom2_ce ? "ROM" : "UNKNOWN"))));
+        end
+      end
+    end
+    
+    // Monitor shadow register changes
+    if (shadow != prev_shadow) begin
+      $display("SHADOW_CHANGE: %08b -> %08b", prev_shadow, shadow);
+      prev_shadow <= shadow;
+    end
+    
+    // DEBUG: Monitor ALL memory controller logic for $0600 range (bypass all conditions)
+    if (addr_bef >= 16'h0600 && addr_bef <= 16'h0610) begin
+      $display("MEM_CTRL_ALL: bank_%02x addr=%04x IO=%b we=%b fastram_ce=%b slowram_ce=%b txt1_shadow=%b",
+               bank_bef, addr_bef, IO, we, fastram_ce_int, slowram_ce_int, txt1_shadow);
+    end
+  end
+
+  reg [7:0] prev_shadow = 8'h00;
+`endif // DEBUG_BANK
+
+  // ROM chip enables (romc/romd/rom1/rom2) are decoded in mmu_inst above.
+
+    // IO read (handle only io_dout, and only here)
+    wire vgc_any_pending = ((VGCINT[5] & VGCINT[1]) |
+                            (VGCINT[6] & VGCINT[2]));
+
+    // Floating bus: the Mega II drives scanned video data onto the bus only
+    // while inside the active display window. During HBL and VBL it performs
+    // slow-RAM refresh and drives nothing, so a floating-bus read returns the
+    // byte the CPU itself left on the bus -- its own operand fetch ($C0 for
+    // LDA $C05A, $5A for the direct-page form). Verified by arekkusu's
+    // FLOATBUS blanking spot checks ("MG2gs": MegaII refresh cycles).
+    reg  [7:0] cpu_last_bus;
+    wire m2_bus_driven;
+
+    // Known gap: in 80-column text the real floating bus shows the MAIN
+    // byte of the current column (aux/main interleave is invisible at
+    // 1MHz), but our text80 sub-fetch pipeline does not expose it at the
+    // CPU sample point -- FLOATBUS mode 9 (TXT2+COL80) trips on this.
+    always_comb begin: io_read
+        io_dout = !m2_bus_driven               ? cpu_last_bus :
+                  (NEWVIDEO[7] && shr_pix_win) ? shr_bus_byte : video_data;
+        case (addr[11:0])
+          12'h011: io_dout = {LCRAM2, 7'h00};
+          12'h012: io_dout = {~RDROM, 7'h00};
+          12'h013: io_dout = {RAMRD, 7'h00};
+          12'h014: io_dout = {RAMWRT, 7'h00};
+          12'h015: io_dout = {INTCXROM, 7'h00};
+          12'h016: io_dout = {ALTZP, 7'h00};
+          12'h017: io_dout = {SLOTC3ROM, 7'h00};
+          12'h018: io_dout = {STORE80, 7'h00};
+
+          // $C019 on the IIgs reports VBL directly (bit 7 = 1 during VBL),
+          // INVERTED from the Apple IIe's VBLBAR. Apple IIGS Tech Note #40:
+          // "On the IIGS, the screen is blanked when the most significant
+          // bit of $C019 is high (greater than 127 or $7F), while on the
+          // IIe, the screen is blanked when the bit is low." All four
+          // reference emulators (MAME IIgs, KEGS, GSplus, Clemens) do it
+          // this way. mega2_vbl is high during VBL, so pass it through.
+          12'h019: io_dout = {mega2_vbl, 7'h00};
+          12'h01a: io_dout = {TEXTG, 7'h00};
+          12'h01b: io_dout = {MIXG, 7'h00};
+          12'h01c: io_dout = {PAGE2, 7'h00};
+          12'h01d: io_dout = {HIRES_MODE, 7'h00};
+          12'h01e: io_dout = {ALTCHARSET, 7'h00};
+          12'h01f: io_dout = {EIGHTYCOL, 7'h00};
+          12'h022: io_dout = TEXTCOLOR;
+
+          // C023: VGC IRQ control/status (GSplus/Clemens semantics)
+          // Read returns synthesized status:
+          //  bit7: any VGC IRQ pending (scanline or 1-sec) when enabled
+          //  bit6: 1-sec pending
+          //  bit5: scanline pending
+          //  bit2: 1-sec enable
+          //  bit1: scanline enable
+          12'h023: io_dout = {vgc_any_pending, VGCINT[6:5], 2'b00,
+                              VGCINT[2:1], 1'b0};
+          // ZipGS registers overlay $C058-$C05F once unlocked (see
+          // rtl/zipgs_regs.sv). Locked reads keep the default behavior
+          // (annunciator soft switches / floating bus).
+          12'h058, 12'h059, 12'h05a, 12'h05b,
+          12'h05c, 12'h05d, 12'h05e, 12'h05f:
+            if (zip_unlocked) io_dout = zip_rdata;
+
+          12'h029: io_dout = NEWVIDEO;
+          12'h02a: io_dout = 'h0; // from gsplus
+          12'h02b: io_dout = C02BVAL; // from gsplus
+          12'h02c: io_dout = 'h0; // from gsplus
+          12'h02d: io_dout = SLTROMSEL;
+          12'h02e: io_dout = V_M2[8:1];
+          12'h02f: io_dout = {V_M2[0], H_CHAR};  // VA (V[0]) + Mega II horiz counter, per TN.IIGS.039
+          12'h031: io_dout = DISK35;
+          12'h032: io_dout = VGCINT;
+          12'h035: io_dout = shadow;
+          12'h036: io_dout = CYAREG;
+          12'h037: io_dout = 'h0; // from gsplus
+          12'h038, 12'h039, 12'h03a, 12'h03b:
+            io_dout = scc_dout_reg;
+          12'h041: io_dout = INTEN;
+          12'h046: io_dout = irq_pending[7:0];
+          12'h047: io_dout = 8'h00;
+          12'h061: io_dout = {sw0, video_data[6:0]};
+          12'h062: io_dout = {sw1, video_data[6:0]};
+          12'h063: io_dout = {sw2, video_data[6:0]};
+          12'h064: io_dout = {~paddle_timer_expired[0], video_data[6:0]};
+          12'h065: io_dout = {~paddle_timer_expired[1], video_data[6:0]};
+          12'h066: io_dout = {~paddle_timer_expired[2], video_data[6:0]};
+          12'h067: io_dout = {~paddle_timer_expired[3], video_data[6:0]};
+          12'h068: io_dout = {ALTZP,PAGE2,RAMRD,RAMWRT,
+                               RDROM,LCRAM2,ROMBANK,INTCXROM};
+          default: ;
+        endcase // case (addr[11:0])
+
+        // IRQ dispatch ROM
+        if (addr[11:0] >= 12'h071 && addr[11:0] <= 12'h7f)
+          io_dout = din;
+
+        // Submodule strobes override generic I/O
+        if (adb_strobe)  io_dout = adb_dout;
+        if (prtc_strobe) io_dout = prtc_dout;
+        if (iwm_strobe)  io_dout = iwm_dout;
+        if (snd_strobe)  io_dout = snd_dout;
+    end // block: io_read
+
+  // IO side effects (reset, write, address-sensitive)
+  always_ff @(posedge CLK_14M) begin
+    // Track active read cycle for SCC to one-shot cs
+    if (!(IO && ~we && (addr[11:0] >= 12'h038) && (addr[11:0] <= 12'h03b))) begin
+      scc_rd_active <= 1'b0;
+    end
+`ifdef DEBUG_RESET
+    if (addr == 16'hC036) begin
+        $display("C036_DEBUG: IO=%b, we=%b, dout=%h", IO, we, dout);
+    end
+`endif
+    if (reset) begin
+      // C036 Speed Register initialization - proper warm/cold reset handling
+      // Bit 7: Fast mode (2.8MHz) - always set
+      // Bit 6: Power-on status - SET on power-up/cold reset, CLEAR on warm reset
+      //        When bit 6=1, ROM performs full initialization (RAM test, etc.)
+      //        When bit 6=0, ROM skips initialization (warm reset behavior)
+      if (cold_reset) begin
+        // Cold/power-on reset: Set bit 6=1 for full ROM initialization sequence
+        CYAREG <= 8'hC0;  // Bit 7=fast mode, Bit 6=power-on status
+`ifdef DEBUG_RESET
+        $display("RESET_TRACE: *** COLD RESET *** CYAREG=$C0 (bit 6=1 for full boot)");
+`endif
+      end else begin
+        // Warm reset: Preserve bit 6, set bit 7, clear other bits
+        CYAREG <= {1'b1, CYAREG[6], 6'b000000};
+`ifdef DEBUG_RESET
+        $display("RESET_TRACE: *** WARM RESET *** CYAREG=$%02X (preserving bit 6=%b)", {1'b1, CYAREG[6], 6'b000000}, CYAREG[6]);
+`endif
+      end
+      shadow <= 8'b0000_1000;  // Original value: bit 3=1 (SHGR disabled), others=0 (enabled)
+      DMAREG <= 8'h00;
+`ifdef DEBUG_RESET
+      $display("SHADOW_REG_INIT: shadow=%08b (Original shadowing config)", 8'b0000_1000);
+      $display("  TXT1=%b HGR1=%b HGR2=%b SHGR=%b AUX=%b TXT2=%b LC=%b",
+               1'b1, 1'b1, 1'b1, 1'b0, 1'b0, 1'b1, 1'b1);
+      $display("  Text/HGR shadowing ACTIVE, Super HiRes shadowing DISABLED");
+`endif
+      NEWVIDEO <= 8'h41;
+      C02BVAL <= 8'h08;
+
+      // FROM GSPLUS
+      INTCXROM<=1'b1;
+      RDROM<=1'b1;
+      LCRAM2<=1'b1;
+      LC_WE_PRE<=1'b0;  // Sather: PRE-WRITE is reset by a system reset (LC_WE itself resets enabled)
+
+      SLTROMSEL<=0;
+      TEXTCOLOR<='hf2;
+      speaker_state<=0;
+      DISK35<=0;
+      VGCINT<=0; //23
+      INTEN<=0; //41
+      // INTFLAG now managed by centralized IRQ logic in iigs.sv
+      STORE80<=0;
+      RAMRD<=0;
+      RAMWRT<=0;
+      INTCXROM<=0;
+      ALTZP<=0;
+      SLOTC3ROM<=0;
+      EIGHTYCOL<=0;
+      ALTCHARSET<=0;
+      PAGE2<=0;
+      AN3<=0;
+      RDROM<=1;
+      LCRAM2<=1;  // Fix: Should be 1 to match STATEREG initialization (bit 1 = LCRAM2)
+      LC_WE<=1;  // Per Apple IIgs HW ref: "reset initializes for writing to the RAM"
+      ROMBANK<=0;;
+`ifdef DEBUG_RESET
+      $display("RESET_TRACE: All registers initialized, waiting for reset release");
+`endif
+    end
+
+    // Track reset release - detect falling edge of reset
+    if (reset_prev && !reset) begin
+`ifdef DEBUG_RESET
+      $display("RESET_TRACE: *** RESET RELEASED *** CPU should now fetch from vector $FFFC");
+`endif
+    end
+    reset_prev <= reset;
+
+    // INTFLAG changes are tracked by centralized IRQ logic in iigs.sv
+    // interrupt_clear_pulse is managed in IO section to avoid race condition
+
+    paddle_trigger <= 1'b0;  // Default: no paddle trigger
+    if (adb_strobe & ~we) begin
+`ifdef DEBUG_BANK
+      if (adb_addr == 8'h24) begin
+        $display("IIGS C024 RESPONSE: adb_dout=0x%02h -> io_dout", adb_dout);
+      end
+`endif
+    end
+    adb_strobe <= 1'b0;
+
+    prtc_strobe <= 1'b0;
+
+    // Check iwm_strobe BEFORE resetting it
+    if (iwm_strobe & ~we & phi2) begin
+`ifdef DEBUG_VERBOSE
+      $display("read_iwm %x ret: %x GC036: %x (addr %x) addr_bef(%x)",addr[11:0],iwm_dout,CYAREG,addr,addr_bef);
+`endif
+    end
+    iwm_strobe <= 1'b0;
+
+    snd_strobe <= 1'b0;
+
+    // Handle SCC read response (same cycle pattern like other peripherals)
+    if (scc_cs & ~we) begin
+      scc_dout_reg <= scc_dout;
+`ifdef DEBUG_SCC
+      $display("SCC_READ_RESPONSE: data=%02X scc_cs=%b ~we=%b addr=C%03X io_dout<=%02X addr_bef=%06X",
+               scc_dout, scc_cs, ~we, addr[11:0], scc_dout, addr_bef);
+`endif
+    end
+
+    scc_cs <= 1'b0;
+    if (IO) begin
+      // interrupt_clear_pulse is now auto-cleared after use, no need to clear here
+      
+      if (we)
+        // write
+        begin
+          case (addr[11:0])
+            // Apple II compatibility soft switches ($C000-$C00F)
+            // These should ONLY respond to bank $00 and $E0 accesses, NOT bank $01/$E1
+            // This prevents MVN/MVP block moves through bank $01 I/O space from corrupting state
+`ifdef DEBUG_IO
+            12'h000: begin if (bank_bef == 8'h00 || bank_bef == 8'he0) begin $display("**STORE80 %x",0); STORE80<= 1'b0 ; end end
+            12'h001: begin if (bank_bef == 8'h00 || bank_bef == 8'he0) begin $display("**STORE80 %x",1); STORE80<= 1'b1 ; end end
+            12'h002: begin if (bank_bef == 8'h00 || bank_bef == 8'he0) begin $display("**RAMRD %x",0); RAMRD<= 1'b0 ; end end
+            12'h003: begin if (bank_bef == 8'h00 || bank_bef == 8'he0) begin $display("**RAMRD %x",1); RAMRD<= 1'b1 ; end end
+            12'h004: begin if (bank_bef == 8'h00 || bank_bef == 8'he0) begin $display("**RAMWRT %x",0); RAMWRT<= 1'b0 ; end end
+            12'h005: begin if (bank_bef == 8'h00 || bank_bef == 8'he0) begin $display("**RAMWRT %x",1); RAMWRT<= 1'b1 ; end end
+            12'h006: begin if (bank_bef == 8'h00 || bank_bef == 8'he0) begin $display("**INTCXROM %x",0);INTCXROM<= 1'b0; end end
+            12'h007: begin if (bank_bef == 8'h00 || bank_bef == 8'he0) begin $display("**INTCXROM %x",1);INTCXROM <= 1'b1; end end
+            12'h008: begin if (bank_bef == 8'h00 || bank_bef == 8'he0) begin $display("**ALTZP %x",0); ALTZP<= 1'b0; end end
+            12'h009: begin if (bank_bef == 8'h00 || bank_bef == 8'he0) begin $display("**ALTZP %x",1); ALTZP<= 1'b1; end end
+            12'h00A: begin if (bank_bef == 8'h00 || bank_bef == 8'he0) begin $display("**SLOTC3ROM %x",0);SLOTC3ROM<= 1'b0; end end
+            12'h00B: begin if (bank_bef == 8'h00 || bank_bef == 8'he0) begin $display("**SLOTC3ROM %x",1);SLOTC3ROM<= 1'b1; end end
+            12'h00C: begin if (bank_bef == 8'h00 || bank_bef == 8'he0) begin $display("**EIGHTYCOL %x",0); EIGHTYCOL<= 1'b0; end end
+            12'h00D: begin if (bank_bef == 8'h00 || bank_bef == 8'he0) begin $display("**EIGHTYCOL %x",1); EIGHTYCOL<= 1'b1; end end
+            12'h00E: begin if (bank_bef == 8'h00 || bank_bef == 8'he0) begin $display("**ALTCHARSET %x",0); ALTCHARSET<= 1'b0; end end
+            12'h00F: begin if (bank_bef == 8'h00 || bank_bef == 8'he0) begin $display("**ALTCHARSET %x",1); ALTCHARSET<= 1'b1; end end
+`else
+            12'h000: begin if (bank_bef == 8'h00 || bank_bef == 8'he0) begin STORE80<= 1'b0 ; end end
+            12'h001: begin if (bank_bef == 8'h00 || bank_bef == 8'he0) begin STORE80<= 1'b1 ; end end
+            12'h002: begin if (bank_bef == 8'h00 || bank_bef == 8'he0) begin RAMRD<= 1'b0 ; end end
+            12'h003: begin if (bank_bef == 8'h00 || bank_bef == 8'he0) begin RAMRD<= 1'b1 ; end end
+            12'h004: begin if (bank_bef == 8'h00 || bank_bef == 8'he0) begin RAMWRT<= 1'b0 ; end end
+            12'h005: begin if (bank_bef == 8'h00 || bank_bef == 8'he0) begin RAMWRT<= 1'b1 ; end end
+            12'h006: begin if (bank_bef == 8'h00 || bank_bef == 8'he0) begin INTCXROM<= 1'b0; end end
+            12'h007: begin if (bank_bef == 8'h00 || bank_bef == 8'he0) begin INTCXROM <= 1'b1; end end
+            12'h008: begin if (bank_bef == 8'h00 || bank_bef == 8'he0) begin ALTZP<= 1'b0; end end
+            12'h009: begin if (bank_bef == 8'h00 || bank_bef == 8'he0) begin ALTZP<= 1'b1; end end
+            12'h00A: begin if (bank_bef == 8'h00 || bank_bef == 8'he0) begin SLOTC3ROM<= 1'b0; end end
+            12'h00B: begin if (bank_bef == 8'h00 || bank_bef == 8'he0) begin SLOTC3ROM<= 1'b1; end end
+            12'h00C: begin if (bank_bef == 8'h00 || bank_bef == 8'he0) begin EIGHTYCOL<= 1'b0; end end
+            12'h00D: begin if (bank_bef == 8'h00 || bank_bef == 8'he0) begin EIGHTYCOL<= 1'b1; end end
+            12'h00E: begin if (bank_bef == 8'h00 || bank_bef == 8'he0) begin ALTCHARSET<= 1'b0; end end
+            12'h00F: begin if (bank_bef == 8'h00 || bank_bef == 8'he0) begin ALTCHARSET<= 1'b1; end end
+`endif
+            12'h010, 12'h026, 12'h027, 12'h070: begin
+              // Note: $C010 (key strobe clear) now handled directly by ADB module
+              if (addr[11:0]==12'h070) begin
+                paddle_trigger <= 1'b1;  // Trigger paddle timers
+`ifdef DEBUG_IO
+                $display("PADDLE TRIGGER");
+`endif
+              end
+              adb_addr <= addr[7:0];
+              adb_strobe <= 1'b1;
+              adb_din <= dout;
+              adb_rw <= 1'b0;
+`ifdef DEBUG_IO
+              $display("ADB WR %03h <= %02h", addr[11:0], dout);
+`endif
+            end
+            12'h011,12'h12,12'h13,12'h14,12'h15,12'h16,12'h17,12'h18,12'h19,12'h1a,12'h1b,12'h1c,
+              12'h01d,12'h1e,12'h1f:
+                begin
+                  //key_reads<=1;
+                end
+            12'h021: ;  // MONOCHROME latch removed (write-only, never read)
+            12'h022: TEXTCOLOR <= dout;
+`ifdef DEBUG_IO
+            12'h023: begin $display("VGCINT 23 2 %x 1 %x",dout[2],dout[1]);VGCINT <= { VGCINT[7:3],dout[2:1],VGCINT[0]} ; end // code can only modify the enable bits
+`else
+            12'h023: VGCINT <= { VGCINT[7:3],dout[2:1],VGCINT[0]} ; // code can only modify the enable bits
+`endif
+            // C028: ROMBANK register does not exist as a separate register on real Apple IIgs hardware.
+            // The Hardware Reference Manual states ROMBANK "must always be 0" and "do not modify this bit".
+            // ROMBANK is only accessible as bit 1 of STATEREG (C068), where it exists but has no functional 
+            // effect (no ROM bank switching occurs). Both KEGS and GSPlus emulators treat C028 as completely
+            // unimplemented. Any software accessing C028 is likely erroneous or written for third-party cards.
+            // 12'h028: [REMOVED - does not exist on real hardware]
+`ifdef DEBUG_IO
+            12'h029: begin $display("**NEWVIDEO %x",dout);NEWVIDEO <= dout; end
+`else
+            12'h029: NEWVIDEO <= dout;
+`endif
+            12'h02b: C02BVAL <= dout; // from gsplus
+`ifdef DEBUG_IO
+            12'h02d: begin SLTROMSEL <= dout; $display("**SLTROMSEL <= %02x (slot7_external=%0d)", dout, dout[7]); end
+`else
+            12'h02d: begin SLTROMSEL <= dout; end
+`endif
+            12'h030: begin if (phi2) speaker_state <= ~speaker_state; end
+            12'h031: begin
+              DISK35<= dout & 8'hc0;
+`ifdef DEBUG_VERBOSE
+              // Only log when the value actually changes to avoid flooding the log
+              // (the ROM writes $C031 on every command boundary).
+              if ((dout & 8'hc0) != DISK35)
+                $display("IWM DBG: WR $C031 <= %02h (DISK35 bit6=%0d bit7=%0d)", dout, (dout>>6)&1'b1, (dout>>7)&1'b1);
+`endif
+            end
+            12'h032:
+              begin
+`ifdef DEBUG_IO
+                $display("VGCINT 32: bit6 %x bit5 %x",dout[6],dout[5]);
+`endif
+                if (dout[6]==1'b0)
+                  VGCINT[6]<=1'b0;
+                if (dout[5]==1'b0)
+                  VGCINT[5]<=1'b0;
+                // clear 7 if both are cleared
+                if ((VGCINT[5]==0 || dout[5]==0) && (VGCINT[6]==0 || dout[6]==0))
+                  VGCINT[7]<=1'b0;
+              end
+            12'h033, 12'h034: begin
+              prtc_rw <= 1'b0;
+              prtc_strobe <= 1'b1;
+              prtc_addr <= ~addr[0];
+              prtc_din <= dout;
+              if (~addr[0])
+                BORDERCOLOR=dout[3:0];
+            end
+            12'h035: begin
+`ifdef DEBUG_IO
+              $display("SHADOW_REG_WRITE: old=%08b new=%08b", shadow, dout);
+              $display("  bit0(TXT1):%b->%b bit1(HGR1):%b->%b bit2(HGR2):%b->%b bit3(SHGR):%b->%b",
+                       shadow[0], dout[0], shadow[1], dout[1], shadow[2], dout[2], shadow[3], dout[3]);
+              $display("  bit4(AUX):%b->%b bit5(TXT2):%b->%b bit6(LC):%b->%b bit7(RSVD):%b->%b",
+                       shadow[4], dout[4], shadow[5], dout[5], shadow[6], dout[6], shadow[7], dout[7]);
+              $display("  TXT1_shadow_enable: %b->%b (0=active)", shadow[0], dout[0]);
+`endif
+              shadow <= dout;
+            end
+`ifdef DEBUG_IO
+            12'h036: begin $display("__CYAREG %x",dout);CYAREG <= dout; end
+`else
+            12'h036: begin CYAREG <= dout; end
+`endif
+            12'h037: DMAREG <= dout;
+            // SCC (Serial Communications Controller) - Zilog 8530
+            12'h038, 12'h039, 12'h03a, 12'h03b: begin
+	      if (phi2) begin
+              scc_cs <= 1'b1;
+              scc_we <= 1'b1;
+              scc_rs <= addr[1:0];  // [1]=data/ctrl, [0]=a/b port
+              scc_din <= dout;
+`ifdef DEBUG_IO
+              $display("SCC_WRITE: addr=C%03X rs=%b data=%02X bank=%02X", addr[11:0], addr[1:0], dout, bank);
+`endif
+		end
+            end
+            12'h03c, 12'h03d, 12'h03e, 12'h03f: begin
+              snd_rw <= 1'b1;
+              snd_strobe <= 1'b1;
+              snd_addr <= addr[1:0];
+              snd_din <= dout;
+`ifdef DEBUG_IO
+              $display("SOUND WR %03h <= %02h (SNDCTL/DATA/APL/APH)", addr[11:0], dout);
+`endif
+            end
+            12'h041: begin
+`ifdef DEBUG_IRQ
+              $display("INTEN: %02x -> %02x",INTEN,{INTEN[7:5],dout[4:0]});
+`endif
+              INTEN <= {INTEN[7:5],dout[4:0]};
+`ifdef DEBUG_IRQ
+              if (~dout[3]) $display("INTEN: VBL interrupt disabled, will be cleared centrally");
+              if (~dout[4]) $display("INTEN: Quarter-second interrupt disabled, will be cleared centrally");
+`endif
+            end
+`ifdef DEBUG_IRQ
+            12'h042: $display("**++UNIMPLEMENTEDMEGAIIINTERRUPT");
+`endif
+            12'h047: begin
+              if (phi2) begin  // Add phi2 gating like other critical I/O
+                // C047 write will be detected by centralized IRQ manager
+`ifdef DEBUG_IRQ
+                $display("VBL_DEBUG: C047 WRITE - Will be processed by centralized IRQ manager at V=%0d H=%0d", V, H);
+`endif
+              end
+            end // clear the interrupts
+`ifdef DEBUG_IO
+            12'h050: begin $display("**TEXTG %x",0); TEXTG<=1'b0;end
+            12'h051: begin $display("**TEXTG %x",1); TEXTG<=1'b1;end
+            12'h052: begin $display("**MIXG %x",0); MIXG<=1'b0;end
+            12'h053: begin $display("**MIXG %x",1); MIXG<=1'b1;end
+            12'h054: begin $display("**PAGE2 %x",0);PAGE2<=1'b0; end
+            12'h055: begin $display("**PAGE2 %x",1);PAGE2<=1'b1; end
+            12'h056: begin $display("**LORES %x",0);HIRES_MODE<=1'b0; end // LORES - turn off hi-res
+            12'h057: begin $display("**HIRES %x",1);HIRES_MODE<=1'b1; end // HIRES - turn on hi-res
+            12'h05e: begin if (!zip_unlocked) begin $display("**CLRAN3"); AN3<=1'b0; end end  // CLRAN3 (annunciator only while ZipGS locked)
+            12'h05f: begin if (!zip_unlocked) begin $display("**SETAN3"); AN3<=1'b1; end end  // SETAN3 (annunciator only while ZipGS locked)
+`else
+            12'h050: begin TEXTG<=1'b0;end
+            12'h051: begin TEXTG<=1'b1;end
+            12'h052: begin MIXG<=1'b0;end
+            12'h053: begin MIXG<=1'b1;end
+            12'h054: begin PAGE2<=1'b0; end
+            12'h055: begin PAGE2<=1'b1; end
+            12'h056: begin HIRES_MODE<=1'b0; end // LORES - turn off hi-res
+            12'h057: begin HIRES_MODE<=1'b1; end // HIRES - turn on hi-res
+            12'h05e: begin if (!zip_unlocked) AN3<=1'b0; end  // CLRAN3 (annunciator only while ZipGS locked)
+            12'h05f: begin if (!zip_unlocked) AN3<=1'b1; end  // SETAN3 (annunciator only while ZipGS locked)
+`endif
+            // $C068: bit0 stays high during boot sequence, why?
+            // if bit0=1 it means that internal ROM at SCx00 is selected
+            // does it mean slot cards are not accessible?
+`ifdef DEBUG_IO
+            12'h068: begin $display("** WR68: %x  ALTZP %x PAGE2 %x RAMRD %x RAMWRT %x RDROM %x LCRAM2 %x ROMBANK %x INTCXROM %x ",dout,dout[7],dout[6],dout[5],dout[4],dout[3],dout[2],dout[1],dout[0]); {ALTZP,PAGE2,RAMRD,RAMWRT,RDROM,LCRAM2,ROMBANK,INTCXROM} <= {dout[7:4],dout[3],dout[2:0]}; end
+`else
+            12'h068: begin {ALTZP,PAGE2,RAMRD,RAMWRT,RDROM,LCRAM2,ROMBANK,INTCXROM} <= {dout[7:4],dout[3],dout[2:0]}; end
+`endif
+
+
+            12'h080,	// Read RAM bank 2 no write
+              12'h084:	// Read bank 2 no write
+                begin
+                  if (phi2) begin
+`ifdef DEBUG_IO
+                    $display("LC_WR C080/C084: RDROM=0 LCRAM2=1 LC_WE=0 (RAM read, no write)");
+`endif
+                    RDROM <= 1'b0;
+                    LCRAM2 <= 1'b1;
+                    LC_WE <= 1'b0;
+                    LC_WE_PRE<=1'b0;
+                  end
+                end
+            12'h081,	// Read ROM write RAM bank 2 (RR)
+              12'h085:
+                begin
+                  if (phi2) begin
+`ifdef DEBUG_IO
+                    $display("WRITE: ROM WRITE THROUGH LC_WE_PRE %x LC_WE %x",LC_WE_PRE,LC_WE);
+`endif
+                    RDROM <= 1'b1;
+                    LCRAM2 <= 1'b1;
+                    // Sather: a WRITE to an odd $C08x never changes write-enable;
+                    // it clears PRE-WRITE (only two consecutive READs enable)
+                    LC_WE_PRE<=1'b0;
+                  end
+                end
+            12'h082,	// Read ROM no write
+              12'h086:
+                begin
+                  if (phi2) begin
+`ifdef DEBUG_IO
+                    $display("LC_WR C082/C086: RDROM=1 LCRAM2=1 LC_WE=0 (ROM read, no write)");
+`endif
+                    RDROM <= 1'b1;
+                    LCRAM2 <= 1'b1;  // FIX: bank 2 for $C080-$C087 range
+                    LC_WE <= 1'b0;
+                    LC_WE_PRE<=1'b0;
+                  end
+                end
+            12'h083,	// Read bank 2 write bank 2(RR)
+              12'h087:
+                begin
+                  if (phi2) begin
+`ifdef DEBUG_IO
+                    $display("WRITE: ROM WRITE THROUGH LC_WE_PRE %x LC_WE %x",LC_WE_PRE,LC_WE);
+`endif
+                    RDROM <= 1'b0;
+                    LCRAM2 <= 1'b1;
+                    // Writes never change write-enable; clear PRE-WRITE
+                    LC_WE_PRE<=1'b0;
+                  end
+                end
+            12'h088,
+              12'h08C:
+                begin
+                  if (phi2) begin
+`ifdef DEBUG_IO
+                    $display("LC_WR C088/C08C: RDROM=0 LCRAM2=0 LC_WE=0 (Bank1 RAM read, no write)");
+`endif
+                    RDROM <= 1'b0;
+                    LCRAM2 <= 1'b0;
+                    LC_WE <= 1'b0;
+                    LC_WE_PRE<=1'b0;
+                  end
+                end
+            12'h089,
+              12'h08D:
+                begin
+                  if (phi2) begin
+`ifdef DEBUG_IO
+                    $display("WRITE: ROM WRITE THROUGH LC_WE_PRE %x LC_WE %x",LC_WE_PRE,LC_WE);
+`endif
+                    RDROM <= 1'b1;
+                    LCRAM2 <= 1'b0;
+                    // Writes never change write-enable; clear PRE-WRITE
+                    LC_WE_PRE<=1'b0;
+                  end
+                end
+            12'h08A,
+              12'h08E:
+                begin
+                  if (phi2) begin
+`ifdef DEBUG_IO
+                    $display("LC_WR C08A/C08E: RDROM=1 LCRAM2=0 LC_WE=0 (Bank1 ROM read, no write)");
+`endif
+                    RDROM <= 1'b1;
+                    LCRAM2 <= 1'b0;
+                    LC_WE <= 1'b0;
+                    LC_WE_PRE<=1'b0;
+                  end
+                end
+            12'h08B,
+              12'h08F:
+                begin
+                  if (phi2) begin
+`ifdef DEBUG_IO
+                    $display("WRITE: ROM WRITE THROUGH LC_WE_PRE %x LC_WE %x",LC_WE_PRE,LC_WE);
+`endif
+                    RDROM <= 1'b0;
+                    LCRAM2 <= 1'b0;
+                    // Writes never change write-enable; clear PRE-WRITE
+                    LC_WE_PRE<=1'b0;
+                  end
+                end
+
+            12'h0e0, 12'h0e1, 12'h0e2, 12'h0e3,
+              12'h0e4, 12'h0e5, 12'h0e6, 12'h0e7,
+              12'h0e8, 12'h0e9, 12'h0ea, 12'h0eb,
+              12'h0ec, 12'h0ed, 12'h0ee, 12'h0ef:
+                begin
+                  iwm_strobe <= 1'b1;
+`ifdef DEBUG_IO
+                  $display("IWM WR %03h <= %02h", addr[11:0], dout);
+`endif
+                end
+            // Slot IO $C0D0-$C0DF (SmartPort) and $C0F0-$C0FF handled externally at top-level. Do not override here.
+            12'h0d0,12'h0d1,12'h0d2,12'h0d3,
+            12'h0d4,12'h0d5,12'h0d6,12'h0d7,
+            12'h0d8,12'h0d9,12'h0da,12'h0db,
+            12'h0dc,12'h0dd,12'h0de,12'h0df: begin
+              // no-op: external SmartPort handles this range
+            end
+            default: begin
+`ifdef DEBUG_IO
+              $display("** IO_WR %x %x",addr[11:0],dout);
+`endif
+            end
+          endcase
+        end
+      else
+        begin
+          // read
+          //$display("** IO_RD %x, RDROM %x ",addr[11:0], RDROM);
+          case (addr[11:0])
+            12'h046: begin
+              // Return interrupt flags directly from irq_pending (bits 3=VBL, 4=QSEC, 0=aggregator)
+`ifdef DEBUG_VERBOSE
+              if (frame_count >= 118 && frame_count <= 138) begin
+                $display("FRAME_DEBUG[%0d]: READ C046 -> %02h (INTEN=%02h cpu_irq=%0d snd=%0d VBL=%0d QSEC=%0d SCC=%0d)",
+                         frame_count, irq_pending[7:0], INTEN, cpu_irq, snd_irq,
+                         irq_pending[3], irq_pending[4], irq_pending[7]);
+              end else begin
+                $display("READ INTFLAG ($C046) -> %02h (irq_pending=%04h INTEN=%02h cpu_irq=%0d)",
+                         irq_pending[7:0], irq_pending, INTEN, cpu_irq);
+              end
+`endif
+            end
+            12'h000, 12'h010, 12'h024, 12'h025,
+            12'h026, 12'h027, 12'h044, 12'h045: begin
+              // ADB addresses - handled by ADB module
+              adb_addr <= addr[7:0];
+              adb_strobe <= 1'b1;
+              adb_rw <= 1'b1;
+`ifdef DEBUG_IO
+              $display("ADB RD %03h", addr[11:0]);
+`endif
+            end
+            12'h070: begin
+              // Paddle trigger - NOT an ADB address
+              paddle_trigger <= 1'b1;
+`ifdef DEBUG_IO
+              $display("PADDLE TRIGGER (READ)");
+`endif
+            end
+            // NOTE: $C064-$C067 are paddle timer reads, handled below at lines 1205-1208
+
+            // $C002-$C005 are WRITE-ONLY softswitches on both IIe and IIgs —
+            // reads must NOT toggle RAMRD/RAMWRT. arekkusu's SWITCHES_V1
+            // softswitch tester exposes this: it reads $C000,X across all
+            // softswitches; toggling RAMRD on a $C003 read swaps the test
+            // code bank under the running CPU and BRKs. Writes are handled
+            // in the `if (we)` branch above.
+            //12'h010: begin io_dout<=key_keys; key_reads<=1; end
+            //12'h010: begin $display("anykeydown: %x",key_anykeydown); if (key_anykeydown) io_dout<='h80 | key_keys ; else io_dout<='h00; end
+
+`ifdef DEBUG_IO
+            12'h015: $display("read INTCXROM %x ", INTCXROM);
+`endif
+            12'h023: begin
+              // Pending when status bit set AND enable bit set
+`ifdef DEBUG_VERBOSE
+              $display("READ C023 (VGC IRQ ctrl/status): any=%0d 1sec_pend=%0d scan_pend=%0d en1s=%0d ensl=%0d RAW_VGCINT=%02x -> %02h",
+                       vgc_any_pending, VGCINT[6], VGCINT[5], VGCINT[2], VGCINT[1], VGCINT, io_dout);
+`endif
+            end
+
+            // C02E/C02F: reading VERTCNT *or* HORIZCNT clears the VGC scanline interrupt
+            // status. Undocumented by Apple but verified on hardware; MAME calls
+            // clear_vgcint(~VGCINT_SCANLINE) from BOTH the $C02E (VERTCNT) and $C02F
+            // (HORIZCNT) read handlers. clear_vgcint there clears the scanline status bit (5)
+            // and only clears the any-pending bit (7) when the 1-second status (6) is also
+            // clear -- so we mirror that exactly. The 1-second interrupt is left untouched.
+            12'h02e, 12'h02f: begin
+              VGCINT[5] <= 1'b0;
+              if (VGCINT[6] == 1'b0)
+                VGCINT[7] <= 1'b0;
+            end
+
+            // C028: ROMBANK register does not exist as a separate register on real Apple IIgs hardware.
+            // See write section above for detailed explanation. Reads to C028 should also be unimplemented.
+            // 12'h028: [REMOVED - does not exist on real hardware]
+            12'h030: if (phi2) speaker_state <= ~speaker_state;
+            // C032: VGC IRQ clear switches (write-to-clear). Read has no side-effects.
+            12'h032: begin
+`ifdef DEBUG_VERBOSE
+              $display("READ C032 (no side-effect): VGCINT=%02h", VGCINT);
+`endif
+            end
+            12'h033, 12'h034: begin
+              prtc_addr <= ~addr[0];
+              prtc_rw <= 1'b1;
+              prtc_strobe <= 1'b1;
+            end
+`ifdef DEBUG_IO
+            12'h036: $display("__CYAREG %x",CYAREG);
+`endif
+            12'h038, 12'h039, 12'h03a, 12'h03b: begin
+              // One-shot SCC read strobe: assert cs exactly once when the CPU
+              // first presents the address, ensuring data is ready in time
+              // without re-triggering on subsequent CLK_14M ticks.
+              if (!scc_rd_active) begin
+                scc_cs <= 1'b1;
+                scc_we <= 1'b0;
+                scc_rs <= addr[1:0];  // [1]=data/ctrl, [0]=a/b port
+                scc_rd_active <= 1'b1;
+`ifdef DEBUG_IO
+                $display("SCC_READ: addr=C%03X rs=%b bank=%02X phi2=%b", addr[11:0], addr[1:0], bank, phi2);
+`endif
+              end
+            end
+
+            12'h03c, 12'h03d, 12'h03e, 12'h03f: begin
+              snd_addr <= addr[1:0];
+              snd_rw <= 1'b0;
+              snd_strobe <= 1'b1;
+            end
+`ifdef DEBUG_IRQ
+            12'h041: begin $display("read INTEN %x",INTEN);end
+            12'h042: $display("**++UNIMPLEMENTEDMEGAIIINTERRUPT");
+`endif
+            // Note: 12'h046 (INTFLAG) is handled earlier in this case statement (line ~1197)
+            //12'h047: begin io_dout <= 'h0; C046VAL &= 'he7; end// some kind of interrupt thing
+`ifdef DEBUG_IO
+            12'h050: begin $display("**TEXTG %x",0); TEXTG<=1'b0;end
+            12'h051: begin $display("**TEXTG %x",1); TEXTG<=1'b1;end
+            12'h052: begin $display("**MIXG %x",0); MIXG<=1'b0;end
+            12'h053: begin $display("**MIXG %x",1); MIXG<=1'b1;end
+            12'h054: begin $display("**PAGE2 %x",0);PAGE2<=1'b0; end
+            12'h055: begin $display("**PAGE2 %x",1);PAGE2<=1'b1; end
+            12'h056: begin $display("**LORES %x",0);HIRES_MODE<=1'b0; end // LORES - turn off hi-res
+            12'h057: begin $display("**HIRES %x",1);HIRES_MODE<=1'b1; end // HIRES - turn on hi-res
+            12'h05e: begin if (!zip_unlocked) begin $display("**CLRAN3"); AN3<=1'b0; end end  // CLRAN3 (annunciator only while ZipGS locked)
+            12'h05f: begin if (!zip_unlocked) begin $display("**SETAN3"); AN3<=1'b1; end end  // SETAN3 (annunciator only while ZipGS locked)
+`else
+            12'h050: begin TEXTG<=1'b0;end
+            12'h051: begin TEXTG<=1'b1;end
+            12'h052: begin MIXG<=1'b0;end
+            12'h053: begin MIXG<=1'b1;end
+            12'h054: begin PAGE2<=1'b0; end
+            12'h055: begin PAGE2<=1'b1; end
+            12'h056: begin HIRES_MODE<=1'b0; end // LORES - turn off hi-res
+            12'h057: begin HIRES_MODE<=1'b1; end // HIRES - turn on hi-res
+            12'h05e: begin if (!zip_unlocked) AN3<=1'b0; end  // CLRAN3 (annunciator only while ZipGS locked)
+            12'h05f: begin if (!zip_unlocked) AN3<=1'b1; end  // SETAN3 (annunciator only while ZipGS locked)
+`endif
+            // Joystick/Paddle I/O
+            12'h061: begin
+`ifdef DEBUG_JOYSTICK
+              $display("JOYSTICK: Read button 1 ($C061) = $%02X (sw0=%d, open_apple=%d, joystick_0[4]=%d)", {sw0, 7'b0000000}, sw0, open_apple, joystick_0[4]);
+`endif
+            end
+            12'h062: begin
+`ifdef DEBUG_JOYSTICK
+              $display("JOYSTICK: Read button 2 ($C062) = $%02X (sw1=%d, closed_apple=%d, joystick_0[5]=%d)", {sw1, 7'b0000000}, sw1, closed_apple, joystick_0[5]);
+`endif
+            end
+            12'h064: begin
+              // $display("PDL0_READ: expired=%d paddle_input=%d", paddle_timer_expired[0], paddle_input[0]);
+            end
+            12'h065: begin
+              // $display("PDL1_READ: expired=%d paddle_input=%d", paddle_timer_expired[1], paddle_input[1]);
+            end
+
+            /*****************************************************************************
+             * Language Card Memory
+             *
+             *           $C080 ;LC RAM bank2, Read and WR-protect RAM
+             *ROMIN =    $C081 ;LC RAM bank2, Read ROM instead of RAM,
+             *                 ;two or more successive reads WR-enables RAM
+             *           $C082 ;LC RAM bank2, Read ROM instead of RAM,
+             *                 ;WR-protect RAM
+             *LCBANK2 =  $C083 ;LC RAM bank2, Read RAM
+             *                 ;two or more successive reads WR-enables RAM
+             *           $C088 ;LC RAM bank1, Read and WR-protect RAM
+             *           $C089 ;LC RAM bank1, Read ROM instead of RAM,
+             *                 ;two or more successive reads WR-enables RAM
+             *           $C08A ;LC RAM bank1, Read ROM instead of RAM,
+             *                 ;WR-protect RAM
+             *LCBANK1 =  $C08B ;LC RAM bank1, Read RAM
+             *                 ;two or more successive reads WR-enables RAM
+             *           $C084-$C087 are echoes of $C080-$C083
+             *           $C08C-$C08F are echoes of $C088-$C08B
+             *
+             ******************************************************************************/
+            12'h080,	// Read RAM bank 2 no write
+              12'h084:	// Read bank 2 no write
+                begin
+                  if (phi2) begin
+`ifdef DEBUG_IO
+                    $display("LC_RD C080/C084: RDROM=0 LCRAM2=1 LC_WE=0 (RAM read, no write)");
+`endif
+                    RDROM <= 1'b0;
+                    LCRAM2 <= 1'b1;
+                    LC_WE <= 1'b0;
+                    LC_WE_PRE<=1'b0;
+                  end
+                end
+            12'h081,	// Read ROM write RAM bank 2 (RR)
+              12'h085:
+                begin
+                  if (phi2) begin
+`ifdef DEBUG_IO
+                    $display("LC_RD C081/C085: ROM WRITE THROUGH LC_WE_PRE %x LC_WE %x",LC_WE_PRE,LC_WE);
+`endif
+                    RDROM <= 1'b1;
+                    LCRAM2 <= 1'b1;
+                  end
+                  if (phi2) begin
+                    // 2nd consecutive odd READ write-enables; an odd read can
+                    // never DISABLE writing (Sather: HRAMWRT' only set by even access).
+                    // phi2 (one pulse per CPU access, like every other soft switch)
+                    // NOT phi0: the free-running 1MHz tick can miss or double-count
+                    // a $C08x access at accelerated speeds / during memory stalls.
+                    if (LC_WE_PRE) LC_WE <= 1'b1;
+                    LC_WE_PRE<=1'b1;  // odd read sets PRE-WRITE
+                  end
+                end
+            12'h082,	// Read ROM no write
+              12'h086:
+                begin
+                  if (phi2) begin
+`ifdef DEBUG_IO
+                    $display("LC_RD C082/C086: RDROM=1 LCRAM2=1 LC_WE=0 (ROM read, no write)");
+`endif
+                    RDROM <= 1'b1;
+                    LCRAM2 <= 1'b1;  // FIX: bank 2 for $C080-$C087 range
+                    LC_WE <= 1'b0;
+                    LC_WE_PRE<=1'b0;
+                  end
+                end
+            12'h083,	// Read bank 2 write bank 2(RR)
+              12'h087:
+                begin
+                  if (phi2) begin
+`ifdef DEBUG_IO
+                    $display("LC_RD C083/C087: ROM WRITE THROUGH LC_WE_PRE %x LC_WE %x",LC_WE_PRE,LC_WE);
+`endif
+                    RDROM <= 1'b0;
+                    LCRAM2 <= 1'b1;
+                  end
+                  if (phi2) begin
+                    // 2nd consecutive odd READ write-enables; an odd read can
+                    // never DISABLE writing (Sather: HRAMWRT' only set by even access).
+                    // phi2 (one pulse per CPU access, like every other soft switch)
+                    // NOT phi0: the free-running 1MHz tick can miss or double-count
+                    // a $C08x access at accelerated speeds / during memory stalls.
+                    if (LC_WE_PRE) LC_WE <= 1'b1;
+                    LC_WE_PRE<=1'b1;  // odd read sets PRE-WRITE
+                  end
+                end
+            12'h088,
+              12'h08C:
+                begin
+                  if (phi2) begin
+`ifdef DEBUG_IO
+                    $display("LC_RD C088/C08C: RDROM=0 LCRAM2=0 LC_WE=0 (Bank1 RAM read, no write)");
+`endif
+                    RDROM <= 1'b0;
+                    LCRAM2 <= 1'b0;
+                    LC_WE <= 1'b0;
+                    LC_WE_PRE<=1'b0;
+                  end
+                end
+            12'h089,
+              12'h08D:
+                begin
+                  if (phi2) begin
+`ifdef DEBUG_IO
+                    $display("LC_RD C089/C08D: ROM WRITE THROUGH LC_WE_PRE %x LC_WE %x",LC_WE_PRE,LC_WE);
+`endif
+                    RDROM <= 1'b1;
+                    LCRAM2 <= 1'b0;
+                  end
+                  if (phi2) begin
+                    // 2nd consecutive odd READ write-enables; an odd read can
+                    // never DISABLE writing (Sather: HRAMWRT' only set by even access).
+                    // phi2 (one pulse per CPU access, like every other soft switch)
+                    // NOT phi0: the free-running 1MHz tick can miss or double-count
+                    // a $C08x access at accelerated speeds / during memory stalls.
+                    if (LC_WE_PRE) LC_WE <= 1'b1;
+                    LC_WE_PRE<=1'b1;  // odd read sets PRE-WRITE
+                  end
+                end
+            12'h08A,
+              12'h08E:
+                begin
+                  if (phi2) begin
+`ifdef DEBUG_IO
+                    $display("LC_RD C08A/C08E: RDROM=1 LCRAM2=0 LC_WE=0 (Bank1 ROM read, no write)");
+`endif
+                    RDROM <= 1'b1;
+                    LCRAM2 <= 1'b0;
+                    LC_WE <= 1'b0;
+                    LC_WE_PRE<=1'b0;
+                  end
+                end
+            12'h08B,
+              12'h08F:
+                begin
+                  if (phi2) begin
+`ifdef DEBUG_IO
+                    $display("LC_RD C08B/C08F: ROM WRITE THROUGH LC_WE_PRE %x LC_WE %x",LC_WE_PRE,LC_WE);
+`endif
+                    RDROM <= 1'b0;
+                    LCRAM2 <= 1'b0;
+                  end
+                  if (phi2) begin
+                    // 2nd consecutive odd READ write-enables; an odd read can
+                    // never DISABLE writing (Sather: HRAMWRT' only set by even access).
+                    // phi2 (one pulse per CPU access, like every other soft switch)
+                    // NOT phi0: the free-running 1MHz tick can miss or double-count
+                    // a $C08x access at accelerated speeds / during memory stalls.
+                    if (LC_WE_PRE) LC_WE <= 1'b1;
+                    LC_WE_PRE<=1'b1;  // odd read sets PRE-WRITE
+                  end
+                end
+
+            12'h0e0, 12'h0e1, 12'h0e2, 12'h0e3,
+              12'h0e4, 12'h0e5, 12'h0e6, 12'h0e7,
+              12'h0e8, 12'h0e9, 12'h0ea, 12'h0eb,
+              12'h0ec, 12'h0ed, 12'h0ee, 12'h0ef:
+                begin
+                  iwm_strobe <= 1'b1;
+`ifdef DEBUG_IO
+                  $display("IWM RD %03h -> %02h", addr[11:0], iwm_dout);
+`endif
+                end
+            // Slot IO $C0D0-$C0DF (SmartPort) and $C0F0-$C0FF handled externally at top-level. Do not override here.
+            12'h0d0,12'h0d1,12'h0d2,12'h0d3,
+            12'h0d4,12'h0d5,12'h0d6,12'h0d7,
+            12'h0d8,12'h0d9,12'h0da,12'h0db,
+            12'h0dc,12'h0dd,12'h0de,12'h0df: begin
+              // no-op: external SmartPort handles this range
+            end
+            // Note: SCC addresses 12'h038-03b are handled earlier in this case statement (line ~1326)
+
+            default: begin
+`ifdef DEBUG_IO
+              $display("** IO_RD %x ",addr[11:0]);
+`endif
+            end
+          endcase
+        end
+    end
+
+    /* *
+     *  IRQ Logic
+     *
+     *  IIe Interrupts (INTEN/ INTFLAG):
+     *  VBL - check interrupts enabled, and  intflag
+     *  Quarter second (clock_frame%15?) - interrupts enabled and intflag
+     *  VGC IIgs Interrupts: VGCINT
+     *  1 second - interrupte enabled , VGC Interrupt
+     *  scanline interrupt sets bit even if it doesn't trigger..
+     * */
+    //
+    //VGCINT[]
+    //reg [7:0] VGCINT; //23
+    //reg [7:0] INTEN; //41    [0][0][0][1/4 sec][VBL][switch][move][mouse]
+    //reg [7:0] INTFLAG; // 46 (47 clear)  AJS [mouse now][mouse last][an3][1/4sec][vbl][switch][move][system irq]
+    VGCINT[4]<=1'b0; // EXT INT ALWAYS 0 in IIGS
+    if (scanline_irq) begin
+      // always set the status bit
+      VGCINT[5] <= 1'b1;
+`ifdef DEBUG_VERBOSE
+      $display("VGC scanline_irq: set VGCINT[5]=1 (enable=%0d)", VGCINT[1]);
+`endif
+      if (VGCINT[1]) // if it is enabled, set the bit
+        begin
+          $display("firing scanline");
+          VGCINT[7]<=1'b1;
+        end
+    end
+    if (onesecond_irq & VGCINT[2]) begin
+      VGCINT[6]<=1'b1;
+      VGCINT[7]<=1'b1;
+`ifdef DEBUG_VERBOSE
+      $display("VGC 1-second irq: set VGCINT[6]=1");
+`endif
+    end
+
+    // VBL interrupt logic is now handled by interrupt controller
+    
+    // Quarter-second and SCC interrupts now handled by interrupt controller
+    // SCC interrupts disabled - SCC wrapper handles interrupt masking
+    // if ((~scc_irq_n & ~scc_irq_d) & INTEN[7]) begin
+    //   INTFLAG[7]<=1'b1;
+    // end
+
+    // INTFLAG[0] management is now handled by interrupt controller
+    /*
+     enum irq_sources
+     {
+     IRQS_DOC        = 0, // sound
+     IRQS_SCAN       = 1,
+     IRQS_ADB        = 2,
+     IRQS_VBL        = 3,
+     IRQS_SECOND     = 4,
+     IRQS_QTRSEC     = 5,
+     IRQS_SLOT       = 6,
+     IRQS_SCC        = 7
+     };
+     */
+
+  end
+  
+  // CPU interrupt output
+  wire cpu_irq;
+
+`ifdef DEBUG_VERBOSE
+  // Trace sound IRQ line transitions and cpu_irq composition to verify behavior
+  reg snd_irq_d;
+  reg cpu_irq_d;
+  reg [15:0] cpu_irq_high_cnt;
+  always @(posedge CLK_14M) begin
+    snd_irq_d <= snd_irq;
+    cpu_irq_d <= cpu_irq;
+    if (cpu_irq) cpu_irq_high_cnt <= cpu_irq_high_cnt + 16'd1; else cpu_irq_high_cnt <= 16'd0;
+    if (snd_irq != snd_irq_d) begin
+      $display("%m: snd_irq %0d -> %0d (VGCINT6&2=%0d VGCINT5&1=%0d INTEN3&F3=%0d INTEN4&F4=%0d INTEN7&F7=%0d)",
+               snd_irq_d, snd_irq,
+               (VGCINT[6]&VGCINT[2]),
+               (VGCINT[5]&VGCINT[1]),
+               (INTEN[3]&INTFLAG[3]),
+               (INTEN[4]&INTFLAG[4]),
+               (INTEN[7]&INTFLAG[7]));
+    end
+    if (cpu_irq != cpu_irq_d) begin
+      // Break down exactly what's causing cpu_irq assertion
+      // cpu_irq = |(irq_pending[15:5]) | (irq_pending[4] & INTEN[4]) | (irq_pending[3] & INTEN[3]) | |(irq_pending[2:1])
+      $display("%m: cpu_irq %0d -> %0d at PC=%06x V=%0d H=%0d INTEN=%02h irq_pending=%04h",
+               cpu_irq_d, cpu_irq, cpu_addr, V, H, INTEN, irq_pending);
+      $display("     IRQ_SOURCE: bits[15:5]=%0d QSEC(bit4&EN4)=%0d VBL(bit3&EN3)=%0d VGC(bits[2:1])=%0d snd=%0d",
+               |(irq_pending[15:5]),
+               (irq_pending[4] & INTEN[4]),
+               (irq_pending[3] & INTEN[3]),
+               |(irq_pending[2:1]),
+               snd_irq);
+      $display("     DETAIL: irq_pending[15:5]=%03x bit4=%0d bit3=%0d bit2=%0d bit1=%0d SCC(bit7)=%0d",
+               irq_pending[15:5], irq_pending[4], irq_pending[3], irq_pending[2], irq_pending[1], irq_pending[7]);
+    end
+    // Periodic summary when IRQ stays high too long  
+    if (cpu_irq_high_cnt == 16'd2000) begin
+      $display("%m: cpu_irq stuck high: INTEN=%02h INTFLAG=%02h VGCINT=%02h snd=%0d", INTEN, INTFLAG, VGCINT, snd_irq);
+      // Disabled safety valve to see real interrupt behavior
+      // INTFLAG[7] <= 1'b0; INTFLAG[4:3] <= 2'b00;
+    end
+  end
+`endif
+
+
+// aux (main/aux select) and the slot decode now live in mmu_inst.
+
+assign rom_bankaddr = (rom2_ce | slot_internalrom_ce) ? 2'b11 : bank[1:0];
+
+wire slot_ce;
+wire is_internal;
+wire is_internal_io;
+wire slot_internalrom_ce;
+
+// try to setup flags for traditional iie style slots
+reg [7:0]  device_select;
+reg [7:0]  io_select;
+wire       hdd_dma;
+assign dbg_hdd_dma = hdd_dma;
+wire [7:0] slowram_dout;
+
+always @(*)
+begin
+   device_select=8'h0;
+   io_select=8'h0;
+   if ((bank == 8'h0 || bank == 8'h1 || bank == 8'he0 || bank == 8'he1) && addr >= 'hc090 && addr < 'hc100 && ~is_internal_io && ~inhibit_cxxx)
+   begin
+//	   $display("device_select addr[10:8] %x %x ISINTERNAL? ",addr[6:4],din);
+          device_select[addr[6:4]]=1'b1;
+  end
+   if ((bank == 8'h0 || bank == 8'h1 || bank == 8'he0 || bank == 8'he1) && addr >= 'hc100 && addr < 'hc800 && ~is_internal && ~CXROM && ~inhibit_cxxx)
+   begin
+//	   $display("io_select addr[10:8] %x din %x HDD_DO %x fastclk %x addr %x RD %x",addr[10:8],din,HDD_DO,fast_clk,addr,we);
+          io_select[addr[10:8]]=1'b1;
+  end
+end
+
+/* verilator lint_off PINMISSING */
+// [gamebub] altsyncram equivalent with both clock enables
+bram_ce #(.widthad_a(17)) slowram
+(
+        .clock_a(CLK_14M),
+        .address_a({bank[0], addr}),
+        .data_a(dout),
+        .q_a(slowram_dout),
+        .wren_a(slowram_we),
+        .enable_a(slowram_ce),
+        .clock_b(clk_vid),
+        .address_b(video_addr[16:0]),
+        .data_b(8'b0),
+        .q_b(video_data),
+        .wren_b(1'b0),
+        .enable_b(ce_pix)
+);
+/* verilator lint_on PINMISSING */
+
+// video_timing's position ports are one bit wider than the counters this
+// core consumes; take the ports at full width and use the low bits.
+wire [10:0] vt_hpos_pad;
+wire [9:0]  vt_vpos_pad, vt_m2v_pad;
+assign H    = vt_hpos_pad[9:0];
+assign V    = vt_vpos_pad[8:0];
+assign V_M2 = vt_m2v_pad[8:0];
+video_timing video_timing(
+.clk_vid(clk_vid),
+.ce_pix(ce_pix),
+.pal(C02BVAL[4]),   // LANGSEL 50Hz bit: PAL 312-line scan
+.hsync(HS),
+.vsync(VS),
+.hblank(HBlank),
+.vblank(VBlank),
+.mega2_vbl(mega2_vbl),
+.hpos(vt_hpos_pad),
+.vpos(vt_vpos_pad),
+.m2_vpos(vt_m2v_pad),
+.hchar(H_CHAR),
+.ph0_phase(PH0_PHASE_VID),
+.ph0_stb(PH0_STB_VID),
+.line_stb(LINE_STB_VID)
+);
+
+
+
+
+wire [22:0] video_addr;
+wire [7:0] video_data;
+wire [7:0] shr_bus_byte;   // SHR pixel byte on the real fetch schedule (vgc)
+
+`ifdef DEBUG_VGC_TXT
+// Beam-race analysis (textfunk): log every VGC text-page-1 fetch near the
+// probe scanline so reads can be correlated against CPU writes (beam_trace).
+always @(posedge clk_vid) if (ce_pix && video_addr[16:0]>=17'h00400 && video_addr[16:0]<17'h00800
+                              && V>=10'd300 && V<=10'd305)
+   $display("VGCRD,%0d,%0d,%0d,%05x", V, H, H_CHAR, video_addr[16:0]);
+`endif
+`ifdef DEBUG_FLOATBUS
+// Log every floating-bus read ($C05A while the Zip is locked) with the beam
+// position and the video byte we return, to diagnose vaporlock accuracy.
+always @(posedge CLK_14M) begin
+  if (phi2 && ~we && IO && addr_bef[7:0] == 8'h5A && ~zip_unlocked)
+    $display("FBUS V=%0d H=%0d HCHAR=%0d vaddr=%05x vdata=%02x", V, H, H_CHAR, video_addr[16:0], video_data);
+end
+`endif
+`ifdef DEBUG_FBSPOT
+// FLOATBUS test result: it stores the failing spot index at $0302 and the
+// actual (wrong) captured byte at $0303 (0 = that phase passed). Log both so
+// we see exactly which spot fails in which video mode, with the value we
+// produced -- $0301 holds the current video mode (args+1).
+always @(posedge CLK_14M) begin
+  if (phi2 && we && bank_bef == 8'h00 && addr_bef == 16'h0301)
+    $display("FBSPOT mode=%02x", dout);
+  if (phi2 && we && bank_bef == 8'h00 && addr_bef == 16'h0302 && dout != 8'h00)
+    $display("FBSPOT   FAIL spot=%02x", dout);
+  if (phi2 && we && bank_bef == 8'h00 && addr_bef == 16'h0303)
+    $display("FBSPOT   actual=%02x", dout);
+  // Temp: watch the snap store into capture cell (63,11) = $4050+63*262+11
+  // (spot #1) to pin the beam position of that capture phase.
+  if (phi2 && we && bank_bef == 8'h00 && addr_bef == 16'h80D5)
+    $display("FBCELL 63x11 dout=%02x V=%0d H=%0d", dout, V, H);
+  // Temp: watch sysHZ ($3CB): $06=NTSC, $85=PAL -- one write per syncBeam.
+  if (phi2 && we && bank_bef == 8'h00 && addr_bef == 16'h03CB)
+    $display("FBHZ sysHZ=%02x V=%0d H=%0d", dout, V, H);
+  // Temp: watch the test-phase arg ($300): 128=unpk, 0=snap, 64=test, 1=pack.
+  if (phi2 && we && bank_bef == 8'h00 && addr_bef == 16'h0300)
+    $display("FBARG phase=%02x V=%0d H=%0d", dout, V, H);
+  // Temp: watch FLOATBUS spot-7 capture cells (16, rows 98-101) = $5112-$5115.
+  if (phi2 && we && bank_bef == 8'h00 && addr_bef >= 16'h5112 && addr_bef <= 16'h5115)
+    $display("FBP7 cell=%0d dout=%02x V=%0d H=%0d", addr_bef - 16'h5112, dout, V, H);
+end
+`endif
+// vbl_irq now handled internally in interrupt logic
+  wire scanline_irq;
+  wire vgc_vbl_irq_pulse;
+
+
+vgc vgc(
+        .CLK_28M(CLK_28M),
+        .CLK_14M(CLK_14M),
+        .clk_vid(clk_vid),
+        .ce_pix(ce_pix),
+        .scanline_irq(scanline_irq),
+	.vbl_irq(vgc_vbl_irq_pulse),
+        .H(H),
+        .V(V),
+        .R(R),
+        .G(G),
+        .B(B),
+        .video_addr(video_addr),
+        .video_data(video_data),
+        .TEXTCOLOR(TEXTCOLOR),
+        .BORDERCOLOR(BORDERCOLOR),
+        .HIRES_MODE(HIRES_MODE),
+        .ALTCHARSET(ALTCHARSET),
+	.AN3(AN3),
+	.STORE80(STORE80),
+        .EIGHTYCOL(EIGHTYCOL),
+        .PAGE2(PAGE2),
+        .TEXTG(TEXTG),
+        .MIXG(MIXG),
+        .SHRG(NEWVIDEO[7]),
+        .DHRG_MONO(NEWVIDEO[5]),
+        .shr_bus_byte(shr_bus_byte)
+);
+
+
+
+// Floating bus: reads from non-existent RAM banks return the bank number
+wire [7:0] floating_bus = (bank_bef >= RAMSIZE && bank_bef < 8'hE0) ? bank_bef : 8'h80;
+
+wire [7:0] din =
+  (io_select[7] == 1'b1 | device_select[7] == 1'b1 | (hdd_dma & hdd_dma_we)) ? HDD_DO :
+  (fastram_ce | rom_ce) ?  top_din :
+  slowram_ce ? slowram_dout :
+  slot_ce ? slot_dout :
+  floating_bus;
+
+  wire [7:0] HDD_DO;
+
+  // CPU data input mux: prioritize ADB reads (combinational), then IWM, then general I/O
+  wire [7:0] cpu_din = IO ? ((adb_read ? adb_dout : (iwm_strobe ? iwm_dout : io_dout)))
+                          : (twgs_sel ? twgs_dout : din);   // TWGS bank $BC overlay (off -> din)
+
+  // Mega II bus-drive window (see io_read): video data is driven during the
+  // 40 active chars of the active rows -- 192 for Apple II modes, 200 for
+  // SHR (the VGC fetches all 160 SHR bytes in that window, 4 per cycle; the
+  // bus view replays them from vgc's shr_line buffer on the real schedule).
+  // SHR additionally drives the next line's SCB + 32 palette bytes in LATE
+  // HBL (vgc's bus-visible prefetch walk, FLOATBUS spots #7/#8) -- there the
+  // live video_data IS the real fetch. Everything else is refresh -> open bus.
+  wire shr_pix_win = (H >= 10'd84)  && (H < 10'd644) && (V >= 9'd256) && (V < 9'd456);
+  wire shr_pre_win = (H >= 10'd770) && (H < 10'd898) && (V >= 9'd255) && (V < 9'd455);
+  assign m2_bus_driven = NEWVIDEO[7]
+      ? (shr_pix_win | shr_pre_win)
+      : ((H >= 10'd84) && (H < 10'd644) && (V >= 9'd256) && (V < 9'd448));
+
+  // Last byte the CPU transferred on its data bus (operand fetches included):
+  // the value a floating-bus read sees when the Mega II is not driving.
+  always @(posedge CLK_14M) if (phi2) cpu_last_bus <= we ? dout : cpu_din;
+
+`ifdef DEBUG_VERBOSE
+  // Debug: log every C026 read showing what cpu_din resolves to
+  always @(posedge CLK_14M) begin
+    if (phi2 && ~we && addr_bef[7:0] == 8'h26 && addr_bef[15:8] == 8'hC0 &&
+        (bank_bef == 8'h00 || bank_bef == 8'h01 || bank_bef == 8'hE0 || bank_bef == 8'hE1)) begin
+      $display("C026_MUX: IO=%b adb_read=%b adb_dout=%02h io_dout=%02h din=%02h -> cpu_din=%02h  bank=%02h",
+               IO, adb_read, adb_dout, io_dout, din, cpu_din, bank_bef);
+    end
+  end
+`endif
+
+  // DEBUG: Track what cpu_din is when CPU actually samples (phi2 high)
+`ifdef DEBUG_TEST0D
+  always @(posedge CLK_14M) begin
+    if (phi2 && ~we && (bank_bef == 8'hE0 || bank_bef == 8'hE1) && addr_bef >= 16'h6100 && addr_bef <= 16'h6105) begin
+      $display("TEST0D_PHI2: bank_bef=%02x addr=%04x cpu_din=%02x slowram_dout=%02x din=%02x",
+               bank_bef, addr_bef, cpu_din, slowram_dout, din);
+    end
+  end
+`endif
+
+`ifdef DEBUG_BANK
+  // Debug: Detect when CPU receives default 0x80 value (potential unhandled I/O)
+  always @(posedge CLK_14M) begin
+    if (~we && cpu_din == 8'h80 && addr_bef[15:8] == 8'hC0) begin
+      $display("ALERT_DEFAULT_READ: CPU received default 0x80 from addr=%04X bank=%02X IO=%b din=%02X io_dout=%02X",
+               addr_bef, bank, IO, din, io_dout);
+    end
+  end
+`endif
+
+  // ----------------------------------------------------------------------------
+  // SIMULATION-ONLY IRQ TRACEPOINTS
+  // - Trace vector fetches (emulation and native)
+  // - Trace writes to ROM-installed IRQ vector pointers in E1 bank
+  // - Trace writes to $00:7000 used by ROM selftests to signal ISR ran
+  // ----------------------------------------------------------------------------
+`ifdef DEBUG_VERBOSE
+  always @(posedge CLK_14M) begin
+    // IRQ/BRK vectors in emulation and native mode
+    if (~we) begin
+      // Check both translated bus and raw CPU view to ensure we catch it
+      if (addr_bus == 24'h00FFFE || addr_bus == 24'h00FFFF ||
+          (bank_bef == 8'h00 && (addr_bef == 16'hFFFE || addr_bef == 16'hFFFF))) begin
+        $display("IRQ_VECTOR_READ_EMU: addr_bus=%06x raw=%02x:%04x data=%02x PC=%06x",
+                 addr_bus, bank_bef, addr_bef, din, cpu_addr);
+      end
+      if (addr_bus == 24'h00FFEE || addr_bus == 24'h00FFEF ||
+          (bank_bef == 8'h00 && (addr_bef == 16'hFFEE || addr_bef == 16'hFFEF))) begin
+        $display("IRQ_VECTOR_READ_NAT: addr_bus=%06x raw=%02x:%04x data=%02x PC=%06x",
+                 addr_bus, bank_bef, addr_bef, din, cpu_addr);
+      end
+    end
+
+    // ROM IRQ vector table updates the selftest uses (E1:0012/0013)
+    if (we && bank_bef == 8'hE1 && (addr_bef == 16'h0012 || addr_bef == 16'h0013)) begin
+      $display("ROM_IRQ_PTR_WRITE: E1:%04x <= %02x at PC=%06x", addr_bef, dout, cpu_addr);
+    end
+
+    // Selftest handshake variable updated by ISR (main bank 00:7000)
+    if (we && bank_bef == 8'h00 && addr_bef == 16'h7000) begin
+      $display("WRITE_007000: <= %02x at PC=%06x (IRQ handshake)", dout, cpu_addr);
+    end
+
+    // Trace possible RAM ISR stub execution (common ROM03 native IRQ vector 00:74AD)
+    if (cpu_vpa && cpu_vda) begin
+      if (cpu_addr[23:0] == 24'h0074AD) begin
+        $display("PC_STUB: Executing at 00:74AD (native IRQ stub) cpu_addr=%06x", cpu_addr);
+      end
+      if (cpu_addr[23:0] >= 24'h007400 && cpu_addr[23:0] < 24'h007500) begin
+        // Light trace in the 0x7400 page to confirm stub path
+        if ((cpu_addr[7:0] & 8'h0F) == 8'h00) begin
+          $display("PC_STUB_PAGE: cpu_addr=%06x", cpu_addr);
+        end
+      end
+      // Trace entry to central ROM ISR locations we’ve seen in logs
+      if (cpu_addr[23:0] == 24'hFEFC3A) begin
+        $display("PC_ROM_ISR: FE:FC3A entry cpu_addr=%06x INTFLAG=%02h INTEN=%02h VBlank=%0d pending[3]=%0d",
+                 cpu_addr, irq_pending[7:0], INTEN, VBlank, irq_pending[3]);
+        // If ROM ISR enters during VBlank with VBL enabled but pending bit not yet visible,
+        // assert it so C046 reports VBL pending to the dispatcher (doc-aligned behavior).
+        if (INTEN[3] && VBlank && !irq_pending[3]) begin
+          irq_pending[3] <= 1'b1;
+          $display("ISR_LATCH_VBL: Set VBL pending at ISR entry (VBlank=1, INTEN3=1)");
+        end
+      end
+      if (cpu_addr[23:0] == 24'hFEFCE3) begin
+        $display("PC_ROM_ISR: FE:FCE3 rtl cpu_addr=%06x", cpu_addr);
+      end
+      if (cpu_addr[23:0] == 24'hFEAA7E) begin
+        $display("PC_ROM_ISR: FE:AA7E rtl cpu_addr=%06x", cpu_addr);
+      end
+    end
+  end
+`endif
+
+  // Debug: Show what CPU actually receives from SCC registers
+`ifdef DEBUG_SCC
+  always @(posedge CLK_14M) begin
+    if (~we && addr >= 16'hC038 && addr <= 16'hC03B) begin
+      $display("SCC_CPU_READ: addr=C%03X cpu_din=%02X io_dout=%02X IO=%b EXTERNAL_IO=%b din=%02X fastram_ce=%b slowram_ce=%b",
+               addr[11:0], cpu_din, io_dout, IO, EXTERNAL_IO, din, fastram_ce, slowram_ce);
+      $display("  IO_DEBUG: addr_bef=%06X bank_bef=%02X addr_check=%b bank_check=%b",
+               addr_bef, bank_bef, (addr_bef[15:8] == 8'hC0),
+               (bank_bef == 8'h00 | bank_bef == 8'h01 | bank_bef == 8'he0 | bank_bef == 8'he1));
+    end
+  end
+`endif
+wire ready_out;
+
+  // Debug: Monitor IRQ_N signal to CPU
+  wire cpu_irq_n = ~cpu_irq;
+  reg cpu_irq_n_d;
+
+`ifdef DEBUG_VERBOSE
+  reg [23:0] cpu_addr_d;
+  reg cpu_vpb_d;
+
+  always @(posedge CLK_14M) begin
+    cpu_irq_n_d <= cpu_irq_n;
+    cpu_addr_d <= cpu_addr;
+    cpu_vpb_d <= cpu_vpb;
+
+    if (cpu_irq_n != cpu_irq_n_d) begin
+      $display("CPU_IRQ_N: %b -> %b (cpu_irq=%b) at PC=%06x INTEN=%02h irq_pending[3]=%b V=%0d H=%0d",
+               cpu_irq_n_d, cpu_irq_n, cpu_irq, cpu_addr, INTEN, irq_pending[3], V, H);
+    end
+
+    // Track IRQ vector fetches (VPA=1, VDA=0, addr=00:FFFE or 00:FFFF)
+    if (phi2 && cpu_vpa && !cpu_vda && (cpu_addr[15:0] == 16'hFFFE || cpu_addr[15:0] == 16'hFFFF)) begin
+      $display("IRQ_VECTOR_FETCH: addr=%06x VPA=%b VDA=%b cpu_irq_n=%b at V=%0d H=%0d",
+               cpu_addr, cpu_vpa, cpu_vda, cpu_irq_n, V, H);
+    end
+
+    // Track CLI instruction execution (look for PC at known CLI locations)
+    if (phi2 && cpu_vpb && !cpu_we_n) begin
+      if (cpu_addr[23:0] == 24'hFFA580 || cpu_addr[23:0] == 24'h000918 || cpu_addr[23:0] == 24'h00F9E1) begin
+        $display("CLI_LOCATION: PC=%06x cpu_irq_n=%b cpu_irq=%b INTEN=%02h irq_pending[3]=%b at V=%0d H=%0d",
+                 cpu_addr, cpu_irq_n, cpu_irq, INTEN, irq_pending[3], V, H);
+      end
+    end
+  end
+`endif
+
+  P65C816 cpu(
+              .CLK(CLK_14M),
+              .RST_N(~reset),
+              .CE(phi2),
+              .RDY_IN(~hdd_dma & ~mem_stall),
+              .NMI_N(twgs_nmi_n),
+              .IRQ_N(cpu_irq_n),
+              .ABORT_N(1'b1),
+              .D_IN(cpu_din),
+              .D_OUT(cpu_dout),
+              .A_OUT(cpu_addr),
+              .WE(cpu_we_n), // This signal is active low at this point
+              .RDY_OUT(ready_out),
+              .VPA(cpu_vpa),
+              .VDA(cpu_vda),
+              .MLB(cpu_mlb),
+              .VPB(cpu_vpb),
+              .I_FLAG(cpu_i_flag)
+              );
+  wire cpu_i_flag;
+
+  // Centralized IRQ management - matches GSplus/Clemens architecture
+  reg [15:0] irq_pending = 0;  // 16-bit interrupt pending register (bit 0=aggregator, 3=VBL, 4=QSEC, 7=SCC)
+  reg interrupt_clear_pulse = 0;
+  reg qtrsecond_irq_d = 0;
+`ifdef DEBUG_VERBOSE
+  reg       irq3_prev = 1'b0;
+`endif
+
+`ifdef DEBUG_VERBOSE
+  // Frame counter for debugging (increments on VBL pulse)
+  reg [15:0] frame_count = 0;
+  reg vgc_vbl_irq_pulse_d = 0;
+
+  // Previous values for interrupt source change detection
+  reg snd_irq_prev = 0;
+  reg scc_irq_n_prev = 1;
+  reg [15:0] irq_pending_prev = 0;
+  reg cpu_irq_prev = 0;
+`endif
+  
+  // Control signals for centralized IRQ management (combinational detection)
+  
+  // Detect C046 reads combinationally (scope to IO region)  
+
+  // Centralized interrupt management - single always block handles all IRQ sources
+  always @(posedge CLK_14M) begin
+    if (reset) begin
+      irq_pending <= 16'h0000;
+      qtrsecond_irq_d <= 1'b0;
+      interrupt_clear_pulse <= 1'b0;
+`ifdef DEBUG_VERBOSE
+      frame_count <= 16'h0000;
+      vgc_vbl_irq_pulse_d <= 1'b0;
+      snd_irq_prev <= 1'b0;
+      scc_irq_n_prev <= 1'b1;
+      irq_pending_prev <= 16'h0000;
+      cpu_irq_prev <= 1'b0;
+`endif
+    end else begin
+
+`ifdef DEBUG_VERBOSE
+      // Increment frame counter on VBL pulse
+      vgc_vbl_irq_pulse_d <= vgc_vbl_irq_pulse;
+      if (vgc_vbl_irq_pulse && !vgc_vbl_irq_pulse_d) begin
+        frame_count <= frame_count + 1;
+        if (frame_count >= 118 && frame_count <= 138) begin
+          $display("FRAME_DEBUG[%0d]: VBL pulse occurred", frame_count);
+        end
+      end
+`endif
+
+      // Handle C047 clear on BOTH read and write (scope to IO region)
+      // Reference emulators (Clemens, GSplus) clear VBL/QSEC on both read and write operations
+      if (IO && phi2 && (addr_bef[11:0] == 12'h047)) begin
+        interrupt_clear_pulse <= 1'b1;
+`ifdef DEBUG_VERBOSE
+        if (we) begin
+          $display("IRQ_MANAGER: C047 clear request processed (write)");
+        end else begin
+          $display("IRQ_MANAGER: C047 clear request processed (read)");
+        end
+`endif
+      end
+
+      // VBL interrupt (bit 3) management
+      // VBL pending flag stays set until explicitly cleared by C046 read or C047 write
+      // Disabling INTEN[3] does NOT clear the pending flag - this allows ROM to read C046 after disabling
+
+      // 1. VBL pulse from VGC (normal case - once per frame at V=199)
+      if (vgc_vbl_irq_pulse && INTEN[3]) begin
+        irq_pending[3] <= 1'b1;
+`ifdef DEBUG_VERBOSE
+        if (frame_count >= 118 && frame_count <= 138) begin
+          $display("FRAME_DEBUG[%0d]: VBL interrupt set (V=%0d, INTEN[3]=1)", frame_count, V);
+        end else begin
+          $display("VBL_INTERRUPT: Pulse detected at V=%0d, INTEN[3]=%0d. IRQ pending.", V, INTEN[3]);
+        end
+`endif
+      end
+
+      // 2. Ensure ROM ISR sees VBL pending when entering dispatcher during VBlank
+      // This matches emulator behavior: with VBL enabled and currently in VBlank,
+      // the VBL cause is visible to the dispatcher even if the enable toggled mid-VBlank.
+      if (cpu_vpa && cpu_vda && (cpu_addr[23:0] == 24'hFEFC3A)) begin
+        if (INTEN[3] && VBlank && !irq_pending[3]) begin
+          irq_pending[3] <= 1'b1;
+`ifdef DEBUG_VERBOSE
+          $display("ISR_LATCH_VBL: Set VBL pending at ISR entry (VBlank=1, INTEN3=1)");
+`endif
+        end
+      end
+
+      // VBL interrupt is edge-triggered at scan line 192 per TN.IIGS.040.
+      // Enabling INTEN[3] during VBlank does NOT retroactively trigger the interrupt.
+      // This matches Clemens clem_vgc.c:255-259 and GSplus do_vbl_int() behavior.
+      // The vgc_vbl_irq_pulse above is the ONLY way VBL pending gets set.
+
+      // Quarter-second interrupt (bit 4) - edge detection
+      // QSEC pending flag stays set until explicitly cleared by C046 read or C047 write
+      // Disabling INTEN[4] does NOT clear the pending flag - allows ROM to read C046 after disabling
+      qtrsecond_irq_d <= qtrsecond_irq;
+      if ((qtrsecond_irq & ~qtrsecond_irq_d) && INTEN[4]) begin
+        irq_pending[4] <= 1'b1;  // Set quarter-second interrupt pending
+`ifdef DEBUG_VERBOSE
+        if (frame_count >= 118 && frame_count <= 138) begin
+          $display("FRAME_DEBUG[%0d]: QSEC interrupt set (INTEN[4]=1)", frame_count);
+        end else begin
+          $display("QSEC_INTERRUPT: Set, INTEN[4]=%0d", INTEN[4]);
+        end
+`endif
+      end
+      
+      // VGC interrupts (bits 1, 2)
+      if (VGCINT[5] & VGCINT[1]) begin
+        irq_pending[1] <= 1'b1;  // VGC scanline interrupt
+      end else begin
+        irq_pending[1] <= 1'b0;
+      end
+      
+      if (VGCINT[6] & VGCINT[2]) begin
+        irq_pending[2] <= 1'b1;  // VGC second interrupt  
+      end else begin
+        irq_pending[2] <= 1'b0;
+      end
+      
+      // SCC interrupt (bit 7) - level driven from SCC core (not gated by INTEN)
+      // Note: cleared by SCC register ops; C047 does not affect this bit
+      irq_pending[7] <= (~scc_irq_n);
+      
+      // Interrupt clearing (C047 write)
+      if (interrupt_clear_pulse) begin
+`ifdef DEBUG_VERBOSE
+        $display("INTERRUPTS: Before clear: INTEN=%02h INTFLAG=%02h VGCINT=%02h V=%0d H=%0d", INTEN, INTFLAG, VGCINT, V, H);
+`endif
+        irq_pending[3] <= 1'b0;  // Clear VBL interrupt
+        irq_pending[4] <= 1'b0;  // Clear quarter-second interrupt
+        interrupt_clear_pulse <= 1'b0;  // Auto-clear the pulse after one cycle
+`ifdef DEBUG_VERBOSE
+        $display("INTERRUPTS: Cleared VBL and QSEC flags via C047 write");
+`endif
+      end
+      
+      // Set aggregator bit (bit 0) - OR of all interrupt sources
+      irq_pending[0] <= |irq_pending[15:1];
+
+
+      // Debug: track VBL pending transitions explicitly
+`ifdef DEBUG_VERBOSE
+      if (irq_pending[3] != irq3_prev) begin
+        $display("IRQ_DEBUG: VBL pending %0d -> %0d at V=%0d H=%0d INTEN=%02h", irq3_prev, irq_pending[3], V, H, INTEN);
+        irq3_prev <= irq_pending[3];
+      end
+
+      // Comprehensive interrupt source tracking for GS/OS boot debug (frames 118-138)
+      if (frame_count >= 118 && frame_count <= 138) begin
+        // Track sound interrupt changes
+        if (snd_irq != snd_irq_prev) begin
+          $display("FRAME_DEBUG[%0d]: snd_irq changed %0d -> %0d", frame_count, snd_irq_prev, snd_irq);
+        end
+        snd_irq_prev <= snd_irq;
+
+        // Track SCC interrupt changes
+        if (scc_irq_n != scc_irq_n_prev) begin
+          $display("FRAME_DEBUG[%0d]: scc_irq_n changed %0d -> %0d (SCC IRQ active=%0d)",
+                   frame_count, scc_irq_n_prev, scc_irq_n, ~scc_irq_n);
+        end
+        scc_irq_n_prev <= scc_irq_n;
+
+        // Track irq_pending register changes (any bit)
+        if (irq_pending != irq_pending_prev) begin
+          $display("FRAME_DEBUG[%0d]: irq_pending changed %04h -> %04h (VBL=%0d QSEC=%0d SCC=%0d VGC1=%0d VGC2=%0d)",
+                   frame_count, irq_pending_prev, irq_pending,
+                   irq_pending[3], irq_pending[4], irq_pending[7], irq_pending[1], irq_pending[2]);
+        end
+        irq_pending_prev <= irq_pending;
+
+        // Track cpu_irq changes
+        if (cpu_irq != cpu_irq_prev) begin
+          $display("FRAME_DEBUG[%0d]: cpu_irq changed %0d -> %0d (INTEN=%02h INTFLAG=%02h snd=%0d)",
+                   frame_count, cpu_irq_prev, cpu_irq, INTEN, INTFLAG, snd_irq);
+        end
+        cpu_irq_prev <= cpu_irq;
+      end
+`endif
+
+    end
+  end
+  
+  // Map centralized IRQ register to INTFLAG for compatibility (no read side-effects here)
+  always @(*) begin
+    INTFLAG = irq_pending[7:0];
+  end
+  
+  // Centralized CPU interrupt output - single point of control
+  // Match Clemens/GSplus: Video IRQs are driven via the VGC path (C023/C032),
+  // not by the Mega II VBL/QSEC (C041/C046) directly. Exclude bits 3 (VBL) and 4 (QSEC)
+  // from the cpu_irq OR to avoid a persistent level-driven VBL from Mega II.
+  // Sound interrupts (snd_irq) go directly to CPU per Clemens emulator_mmio.c:580 and GSplus sound.c
+  //assign cpu_irq = |(irq_pending & 16'hFFE6);  // mask out bit0 (aggregator), bit3 (VBL), bit4 (QSEC)
+       assign cpu_irq = |(irq_pending[15:5])        |  // bits 15-5: other interrupts
+                             (irq_pending[4] & INTEN[4]) |  // bit 4: QSEC (gated by enable)
+                             (irq_pending[3] & INTEN[3]) |  // bit 3: VBL (gated by enable)
+                             |(irq_pending[2:1])        |  // bits 2-1: VGC interrupts (bit 0 is aggregator)
+                             snd_irq                    |  // sound/DOC interrupt (not in C046 INTFLAG)
+                             adb_kbd_srq_irq;              // ADB keyboard SRQ (autopoll-off; cleared by TALK-R0 drain)
+
+
+  always @(posedge CLK_14M)
+    begin
+      if (phi2)
+        begin
+          //$display("ready_out %x bank %x cpu_addr %x  addr_bus %x cpu_din %x dout %x cpu_we_n %x aux %x LCRAM2 %x RDROM %x LC_WE %x cpu_irq %x akd %x cpu_vpb %x RAMRD %x RDROM %x, iwm_strobe %x iwm_dout %x io_dout %x",ready_out,bank,cpu_addr,addr_bus,cpu_din,dout,cpu_we_n,aux,LCRAM2,RDROM,LC_WE,cpu_irq,key_anykeydown,cpu_vpb,RAMRD,RDROM,iwm_strobe,iwm_dout,io_dout);
+          // to debug interrupts: (gated off — fires every phi2 when cpu_irq is
+          // level-high from VGC scanline ints and floods stdout. Re-enable with
+          // DEBUG_IRQ if needed.)
+`ifdef DEBUG_IRQ
+          if (cpu_irq)
+            $display("cpu_irq %x VBL(any=%0d,1s=%0d,sl=%0d,en1s=%0d,ensl=%0d) INTEN=%02h INTFLAG=%02h VGCINT=%02h snd_irq %0d", cpu_irq,
+                     (VGCINT[7]), (VGCINT[6]&VGCINT[2]), (VGCINT[5]&VGCINT[1]), VGCINT[2], VGCINT[1], INTEN, INTFLAG, VGCINT, snd_irq);
+`endif
+        end
+    end
+
+
+`ifdef VERILATOR
+  reg [19:0] dbg_pc_counter;
+  always @(posedge cpu_vpa or posedge cpu_vda or posedge reset)
+    if (reset)
+      dbg_pc_counter <= 20'd0;
+    else if (cpu_vpa & cpu_vda)
+      dbg_pc_counter <= dbg_pc_counter + 20'd1;
+`endif
+
+  wire adb_capslock;
+  wire adb_kbd_srq_irq;   // ADB keyboard SRQ interrupt (cleared via TALK-R0 drain in adb.v, not C047)
+  assign capslock = adb_capslock;
+  wire adb_open_apple, adb_closed_apple, adb_shift, adb_ctrl;
+  wire adb_akd;
+  wire [7:0] adb_K;
+  wire adb_reset_key_pressed;  // Reset key (F11) is pressed
+
+  // Keyboard-triggered reset logic
+  // Ctrl+F11 = warm reset, Ctrl+OpenApple+F11 = cold reset
+  assign keyboard_reset = adb_reset_key_pressed & adb_ctrl;
+  assign keyboard_cold_reset = adb_reset_key_pressed & adb_ctrl & adb_open_apple;
+
+  // For ADB reads, use combinational address for immediate response
+  // For ADB writes, use registered address that's set when strobe is asserted
+  wire [7:0] adb_addr_mux = adb_read ? addr_bef[7:0] : adb_addr;
+  wire adb_rw_mux = adb_read ? 1'b1 : adb_rw;  // Always read when adb_read is active
+  // Combinational strobe for reads (for state updates), registered strobe for writes
+  wire adb_strobe_mux = adb_read | adb_strobe;
+
+  adb adb(
+          .CLK_14M(CLK_14M),
+          .cen(phi2),
+          .reset(reset),
+          .cold_reset(cold_reset),
+          .rom_select(rom_select),
+          .CLR80COL(), .STORE80(), .RAMRD(), .RAMWRT(), .ALTZP(),
+          .addr(adb_addr_mux),
+          .rw(adb_rw_mux),
+          .din(adb_din),
+          .dout(),  // Unused - using dout_comb for same-cycle reads
+          .dout_comb(adb_dout),  // Combinational output for CPU reads
+          .irq(/* unused - ADB IRQ handled via registers */),
+          .kbd_srq_irq(adb_kbd_srq_irq),   // keyboard Service Request IRQ (autopoll-off raw events)
+          .strobe(adb_strobe_mux),
+          .capslock(adb_capslock),
+          .ps2_key(ps2_key),
+          .ps2_mouse(ps2_mouse),
+          .selftest_override(selftest_override), // Self-test mode override
+          .vbl_count(V[8:0]),              // VBL counter for key repeat timing
+          // Apple IIe compatibility outputs (replacing old keyboard module)
+          .open_apple(adb_open_apple),     // Command key = Open Apple
+          .closed_apple(adb_closed_apple), // Option key = Closed Apple
+          .apple_shift(adb_shift),         // Shift key
+          .apple_ctrl(adb_ctrl),           // Control key
+          .akd(adb_akd),                   // Any key down
+          .K(adb_K),                       // Apple IIe character with strobe
+          .reset_key_pressed(adb_reset_key_pressed)  // Reset key (F11) is pressed
+          );
+
+  prtc prtc(
+            .CLK_14M(CLK_14M),
+            .cen(phi2),
+            .timestamp(timestamp),
+            .reset(reset),
+            .addr(prtc_addr),
+            .din(prtc_din),
+            .dout(prtc_dout),
+            .onesecond_irq(onesecond_irq),
+            .qtrsecond_irq(qtrsecond_irq),
+            .rw(prtc_rw),
+            .strobe(prtc_strobe),
+            .bk_addr(nv_addr[7:0]),
+            .bk_wr(nv_wr & nv_pram_sel),
+            .bk_data(nv_din),
+            .bk_q(nv_pram_q)
+            );
+
+  // NVRAM backup block map (one 512-byte SD block, slot 4 in the top level):
+  //   bytes   0-255  IIgs battery PRAM (prtc)
+  //   bytes 256-287  TransWarp GS X2444 NVRAM (32 bytes)
+  //   bytes 288-511  unused, read back as $FF
+  wire nv_pram_sel = ~nv_addr[8];
+  wire nv_twgs_sel = nv_addr[8] & (nv_addr[7:5] == 3'b000);
+  wire [7:0] nv_pram_q, nv_twgs_q;
+  assign nv_dout = nv_pram_sel ? nv_pram_q :
+                   nv_twgs_sel ? nv_twgs_q : 8'hFF;
+
+  // Hardware-accurate IWM with WOZ/flux-based disk interface
+  iwm_woz iwmc (
+      // Global clocks/resets
+      .CLK_14M(CLK_14M),
+      .CLK_7M_EN(clk_7M_en),
+      .Q3(q3_en),
+      .PH0(phi0),
+      .PH2(phi2),
+      .RESET(reset),
+      // Bus interface
+      .IO_SELECT(iwm_device_select),
+      .DEVICE_SELECT(iwm_device_select),
+      .WR_CYCLE(cpu_we_n),  // 1 = read, 0 = write (matches cpu_we_n)
+      .VDA(cpu_vda),
+      .A({8'b0, cpu_addr[7:0]}),  // Combinational address (low byte; zero-extended)
+      .D_IN(cpu_dout),      // Combinational data
+      .D_OUT(iwm_dout),
+      // Drive status and control
+      .DISK_READY(DISK_READY),
+      .DISK35(DISK35),
+      .WRITE_PROTECT(floppy_wp),
+      // WOZ bit interface for 3.5" drive 1
+      .WOZ_TRACK3(WOZ_TRACK3),
+      .WOZ_TRACK3_BIT_ADDR(WOZ_TRACK3_BIT_ADDR),
+      .WOZ_TRACK3_STABLE_SIDE(WOZ_TRACK3_STABLE_SIDE),
+      .WOZ_TRACK3_BIT_DATA(WOZ_TRACK3_BIT_DATA),
+      .WOZ_TRACK3_BIT_COUNT(WOZ_TRACK3_BIT_COUNT),
+      .WOZ_TRACK3_READY(WOZ_TRACK3_READY),
+      .WOZ_TRACK3_DATA_VALID(WOZ_TRACK3_DATA_VALID),
+      .WOZ_TRACK3_LOAD_COMPLETE(WOZ_TRACK3_LOAD_COMPLETE),
+      .WOZ_TRACK3_IS_FLUX(WOZ_TRACK3_IS_FLUX),
+      .WOZ_TRACK3_FLUX_SIZE(WOZ_TRACK3_FLUX_SIZE),
+      .WOZ_TRACK3_FLUX_TOTAL_TICKS(WOZ_TRACK3_FLUX_TOTAL_TICKS),
+      .WOZ_TRACK3_WP(WOZ_TRACK3_WP),
+      .WOZ_TRACK3_BIT_DATA_IN(WOZ_TRACK3_BIT_DATA_IN),
+      .WOZ_TRACK3_BIT_WE(WOZ_TRACK3_BIT_WE),
+      .WOZ_TRACK3_BIT_WR_ADDR(WOZ_TRACK3_BIT_WR_ADDR),
+      // WOZ bit interface for 5.25" drive 1
+      .WOZ_TRACK1(WOZ_TRACK1),
+      .WOZ_TRACK1_QTRACK(WOZ_TRACK1_QTRACK),
+      .WOZ_TRACK1_DATA_VALID(WOZ_TRACK1_DATA_VALID),
+      .WOZ_TRACK1_BIT_ADDR(WOZ_TRACK1_BIT_ADDR),
+      .WOZ_TRACK1_BIT_DATA(WOZ_TRACK1_BIT_DATA),
+      .WOZ_TRACK1_BIT_COUNT(WOZ_TRACK1_BIT_COUNT),
+      .WOZ_TRACK1_LOAD_COMPLETE(WOZ_TRACK1_LOAD_COMPLETE),
+      .WOZ_TRACK1_IS_FLUX(WOZ_TRACK1_IS_FLUX),
+      .WOZ_525_BIT_TIMING(WOZ_525_BIT_TIMING),
+      .WOZ_TRACK1_FLUX_SIZE(WOZ_TRACK1_FLUX_SIZE),
+      .WOZ_TRACK1_FLUX_TOTAL_TICKS(WOZ_TRACK1_FLUX_TOTAL_TICKS),
+      .WOZ_TRACK1_WP(WOZ_TRACK1_WP),
+      .WOZ_TRACK1_BIT_DATA_IN(WOZ_TRACK1_BIT_DATA_IN),
+      .WOZ_TRACK1_BIT_WE(WOZ_TRACK1_BIT_WE),
+      .WOZ_TRACK1_BIT_WR_ADDR(WOZ_TRACK1_BIT_WR_ADDR),
+      // Motor status for clock slowdown
+      .FLOPPY_MOTOR_ON(floppy_motor_on),
+      .IWM_ENBL(iwm_enbl),
+      .FLOPPY35_MOTOR_ON(floppy35_motor_on),
+      .DRIVE35_EJECT_REQ(drive35_eject_req)
+  );
+  // Internal wires not used with flux-based IWM
+
+    // Legacy slot-7 HDD (supports 4 units)
+    hdd hdd(
+        .CLK_14M(CLK_14M),
+        .phi0(phi2 & ~mem_stall),    // Gate on CPU clock (ph2_en), held during memory-path stalls: the DMA engine does not honor CPU RDY, and its fast-RAM reads go through the same (possibly missing) cache path
+        .IO_SELECT(io_select[7]),
+        .DEVICE_SELECT(device_select[7]),
+        //.IO_SELECT(1'b0),
+        //.DEVICE_SELECT(1'b0),
+        .RESET(reset),
+        .A(addr),
+        .RD(~we),
+        .D_IN(dout),
+        .D_OUT(HDD_DO),
+        .DMA(hdd_dma),
+        .DMA_ADDR(hdd_dma_addr),
+        .DMA_WE(hdd_dma_we),
+        .sector(HDD_SECTOR),
+        .sd_rd(HDD_READ),
+        .sd_wr(HDD_WRITE),
+        .img_mounted(HDD_MOUNTED),
+        .img_readonly(img_readonly),
+        .img_size(img_size),
+        .hps_ram_addr(HDD_RAM_ADDR),
+        .ram_di(HDD_RAM_DI),
+        .ram_do(HDD_RAM_DO),
+        .ram_we(HDD_RAM_WE),
+        .sd_ack(HDD_ACK)
+    );
+/*
+    // Native SmartPort HDD on Slot 5 ($C0D0–$C0DF), no ROM
+    sp_hdd sp_hdd(
+        .CLK_14M(CLK_14M),
+        .phi0(phi0),
+        .IO_SELECT(io_select[5]),
+        .DEVICE_SELECT(device_select[5]),
+        .RESET(reset),
+        .A(addr),
+        .RD(~we),
+        .D_IN(dout),
+        .D_OUT(SP_DO),
+        .sector(HDD_SECTOR),
+        .hdd_read(HDD_READ),
+        .hdd_write(HDD_WRITE),
+        .hdd_mounted(HDD_MOUNTED),
+        .hdd_protect(HDD_PROTECT),
+        .ram_addr(HDD_RAM_ADDR),
+        .ram_di(HDD_RAM_DI),
+        .ram_do(HDD_RAM_DO),cpu_we_n
+        .ram_we(HDD_RAM_WE)
+    );
+*/
+  sound snd(
+            .ca(),
+            .CLK_14M(CLK_14M),
+            .clk_7M_en(clk_7M_en),
+            .ph0_en(phi2),    // Gate on CPU clock (ph2_en) not raw ph0 to prevent double-fire during sync waits
+            .reset(reset),
+            .select(snd_strobe),
+            .wr(snd_rw),
+            .host_addr(snd_addr),
+            .host_data_in(snd_din),
+            .host_data_out(snd_dout),
+            .sound_out_l(AUDIO_L),
+            .sound_out_r(AUDIO_R),
+            .irq(snd_irq),
+            .speaker_state(speaker_state)
+            );
+
+  // =========================================================================
+  // SCC (Serial Communications Controller) - Zilog Z8530
+  //
+  // Channel, Slot, and Register Mapping Reference:
+  // - Apple IIgs Hardware Reference (2nd Ed), Chapter 7 "Built-in I/O Ports and Clock"
+  //   (Table 7-10 "SCC I/O Port Addresses", p. 161) and Chapter 8 "Expansion Slots"
+  //   (Slot Register $C02D, pp. 152-154).
+  //
+  // Hardware Architecture & Historical Rationale:
+  //   Channel A -> Printer Port (Port 1 / Slot 1): Command/Status $C039, Data $C03B
+  //   Channel B -> Modem Port   (Port 2 / Slot 2): Command/Status $C038, Data $C03A
+  //
+  // NOTE ON MACINTOSH vs. APPLE IIGS DIFFERENCE:
+  // - On the Macintosh: Channel A is the Modem port and Channel B is the Printer port.
+  // - On the Apple IIgs: Apple assigned Channel A to Slot 1 (Printer Port) and Channel B
+  //   to Slot 2 (Modem Port) to preserve classic Apple II slot conventions:
+  //     Slot 1 = Printer
+  //     Slot 2 = Modem
+  //
+  // OSD Switching (serial_port_printer = status[26]):
+  //   0 = Modem (Slot 2, Channel B) routed to top-level UART pins.
+  //   1 = Printer (Slot 1, Channel A) routed to top-level UART pins.
+  // Both channels have full, symmetric hardware flow control (CTS/RTS):
+  //   - The active channel connects to physical UART_TXD, UART_RXD, UART_RTS, UART_CTS.
+  //   - The inactive channel is safely idled: RXD held high (mark), CTS held low (clear).
+  // In --serial-loopback mode, Channel A and Channel B TXD/RXD and RTS/CTS are cross-wired
+  // (external loopback cable) for diagnostic testing.
+  // =========================================================================
+  wire scc_txd_a;
+  wire scc_txd_b;
+  wire scc_rts_a;
+  wire scc_rts_b;
+  assign UART_TXD = serial_port_printer ? scc_txd_a : scc_txd_b;
+  assign UART_RTS = serial_port_printer ? scc_rts_a : scc_rts_b;
+
+  scc_iigs_wrapper scc_inst(
+            .clk_14m(CLK_14M),
+            .ph0_en(phi0),
+            .ph2_en(phi2),
+            .q3_en(q3_en),
+            .reset(reset),
+            .cs(scc_cs),
+            .we(scc_we),
+            .rs(scc_rs),
+            .wdata(scc_din),
+            .rdata(scc_dout),
+            .irq_n(scc_irq_n),
+            // Channel A = Printer port (Slot 1)
+            .txd_a(scc_txd_a),
+            .rxd_a(serial_loopback ? scc_txd_b : (serial_port_printer ? UART_RXD : 1'b1)),
+            .rts_a(scc_rts_a),
+            .cts_a(serial_loopback ? scc_rts_b : (serial_port_printer ? UART_CTS : 1'b0)),
+            // Channel B = Modem port (Slot 2)
+            .txd_b(scc_txd_b),
+            .rxd_b(serial_loopback ? scc_txd_a : (serial_port_printer ? 1'b1 : UART_RXD)),
+            .rts_b(scc_rts_b),
+            .cts_b(serial_loopback ? scc_rts_a : (serial_port_printer ? 1'b0 : UART_CTS)),
+            .dsr_a(1'b0)        // DSR asserted (active low on real hardware)
+				);
+
+  // Apple IIe compatibility signals now come from ADB module.
+  //
+  // On the Apple IIe, $C011-$C01F return (status_bit << 7) | last_ASCII[6:0],
+  // where the keyboard shadow persists across strobe clears. The IIgs IOU
+  // does NOT mirror the keyboard character onto these registers — the Keyglu
+  // $C010 read exposes only AKD (bit 7), so the low 7 bits on $C011-$C01F
+  // are always zero.
+  //
+  // Verified against all four reference emulators (MAME apple2gs.cpp:1550-96,
+  // KEGS moremem.c:1112-1142, GSplus moremem.c:1251-1281, Clemens
+  // clem_mmio.c:680-715 / clem_vgc.c:293). Previously we carried the IIe
+  // shadow, which wedged Mean 18 at $02:5540 after any keystroke (it polls
+  // `lda [$f3]; and #$00ff; beq` against $C019 and needs the low byte to
+  // reach 0). $C000 (line ~2710 onward) keeps the persistent character —
+  // that register is the real keyboard data port on both machines.
+  //wire       key_anykeydown = adb_akd;     // Any key down from ADB
+  wire       open_apple = adb_open_apple;  // Command key from ADB
+  wire       closed_apple = adb_closed_apple; // Option key from ADB
+  
+  // Old keyboard module removed - ADB now handles all keyboard functionality
+  // key_reads variable removed - ADB handles $C010 strobe clearing internally
+
+  // === Joystick/Paddle Support ===
+
+  // Convert from MiSTer joystick_l_analog signed format to unsigned paddle values
+  // MiSTer format: signed 8-bit per axis (-128 to +127, center=0)
+  //   joystick_l_analog_0[7:0]  = X axis (negative=left, positive=right)
+  //   joystick_l_analog_0[15:8] = Y axis (negative=up, positive=down)
+  // Apple II paddle format: unsigned 8-bit (0-255, center=128)
+  //   Paddle 0 = X (0=left, 255=right)
+  //   Paddle 1 = Y (0=up, 255=down)
+  // Conversion: unsigned = signed XOR 0x80 (flip sign bit)
+  wire [7:0] paddle_input[3:0];
+  assign paddle_input[0] = joystick_l_analog_0[7:0] ^ 8'h80;   // P1 X
+  assign paddle_input[1] = joystick_l_analog_0[15:8] ^ 8'h80;  // P1 Y
+  assign paddle_input[2] = joystick_l_analog_1[7:0] ^ 8'h80;   // P2 X
+  assign paddle_input[3] = joystick_l_analog_1[15:8] ^ 8'h80;  // P2 Y
+
+  // Paddle timing simulation
+  wire [3:0] paddle_timer_expired;
+  reg paddle_trigger;
+  reg [31:0] tick_counter_14m;  // 14MHz tick counter for wall-clock timing
+
+  // Increment 14MHz tick counter (wall-clock time, independent of CPU speed)
+  always @(posedge CLK_14M) begin
+    if (reset)
+      tick_counter_14m <= 32'd0;
+    else
+      tick_counter_14m <= tick_counter_14m + 32'd1;
+  end
+
+  genvar i;
+  generate
+    for (i = 0; i < 4; i = i + 1) begin : paddle_timers
+      paddle_timer timer_inst (
+        .clk(CLK_14M),
+        .reset(reset),
+        .trigger(paddle_trigger),
+        .paddle_value(paddle_input[i]),
+        .tick_counter(tick_counter_14m),
+        .timer_expired(paddle_timer_expired[i])
+      );
+    end
+  endgenerate
+
+  // Button merging (physical joystick buttons override keyboard Apple keys)
+  // MiSTer joystick bits: [3:0]=directions, [31:4]=action buttons
+  wire sw0 = joystick_0[4] | open_apple;    // Open Apple (Button 0)
+  wire sw1 = joystick_0[5] | closed_apple;  // Closed Apple (Button 1)
+  wire sw2 = joystick_0[6];                 // Button 2  
+  //wire sw3 = joystick_0[7];                 // Button 3
+
+// ROM access signal: refresh penalty is hidden during ROM reads
+assign rom_ce = rom1_ce | rom2_ce | romc_ce | romd_ce | slot_internalrom_ce;
+
+// ---------------------------------------------------------------------------
+// ZipGS accelerator registers ($C058-$C05F overlay, KEGS semantics) + host
+// (OSD / --speed) control. Both set the same state, so software reading the
+// Zip registers always agrees with the host-selected speed and vice versa.
+// ---------------------------------------------------------------------------
+wire       zip_unlocked_raw;
+wire       zip_accel_en;
+wire [2:0] zip_speed_code;
+wire [7:0] zip_rdata;
+wire       zip_cache_disable;
+wire [7:0] zip_slot_delay;
+// One write strobe per CPU I/O write to $C058-$C05F (phi2 = one pulse per CPU
+// cycle, same pattern as the $C030 speaker toggle). IO already excludes
+// EXTERNAL_IO and non-I/O banks. zip_regs_en=0 (OSD Card is not ZipGS)
+// blocks the unlock sequence so the Zip never becomes visible.
+wire       zip_wr_stb = IO && we && phi2 && (addr_bef[7:3] == 5'b01011) && zip_regs_en;
+// All software-visibility consumers (read overlay, AN3 write guards, fast
+// register timing) key off this; forcing it low with zip_regs_en also covers
+// a mid-session OSD disable while software had the Zip unlocked.
+wire       zip_unlocked = zip_unlocked_raw && zip_regs_en;
+
+// The zipgs_regs state doubles as the delay-enable store for the "None (OSD
+// speed only)" card mode: the registers exist either way, software just can't
+// see them unless the ZipGS card is selected. The host path is disabled while
+// the TWGS card is selected (host_speed forced 0) so only ONE front-end drives
+// the speed engine — a real machine holds one accelerator.
+wire zip_spkr_delay_en, zip_pdl_delay_en, zip_ctr_delay_en, zip_cps_follow_en;
+wire zip_irq_delay_en;
+zipgs_regs zipgs (
+    .clk(CLK_14M),
+    .reset(reset),
+    .wr_stb(zip_wr_stb),
+    .wr_addr(addr_bef[2:0]),
+    .wr_data(dout),
+    .rd_addr(addr_bef[2:0]),
+    .rd_data(zip_rdata),
+    .mtr_slow(~CYAREG[7]),
+    .host_speed(twgs_present ? 3'd0 : host_speed),
+    .host_spkr_en(osd_spkr_delay),
+    .host_pdl_en(osd_pdl_delay),
+    .host_ctr_en(osd_ctr_delay),
+    .host_cps_en(osd_cps_follow),
+    .host_irq_en(osd_irq_delay),
+    .zip_unlocked(zip_unlocked_raw),
+    .accel_en(zip_accel_en),
+    .speed_code(zip_speed_code),
+    .cache_disable(zip_cache_disable),
+    .slot_delay(zip_slot_delay),
+    .spkr_delay_en(zip_spkr_delay_en),
+    .pdl_delay_en(zip_pdl_delay_en),
+    .ctr_delay_en(zip_ctr_delay_en),
+    .cps_follow_en(zip_cps_follow_en),
+    .irq_delay_en(zip_irq_delay_en)
+);
+
+// Zip cache-disable ($C059 bit 7) out to the SDRAM cache in the top level.
+assign cache_disable = zip_cache_disable;
+
+// ---- TransWarp GS card (bank $BC): detection ROM + $BC0000 latch + NVRAM ----
+// Rides the same speed engine as ZipGS (turbo_code = host_speed, so the accel
+// bit engages whatever the OSD ceiling is). twgs_present=0 -> everything below
+// is a pass-through (sel=0, accel_en=0), so the machine is bit-identical to
+// today when the card is off. Used at the cpu_din overlay (~line 1850) and the
+// fast_thresh combine below.
+wire        twgs_sel;
+wire [7:0]  twgs_dout;
+wire        twgs_accel_en;
+wire [2:0]  twgs_speed_code;
+wire [2:0]  twgs_cfg_speed;
+wire        twgs_irq_logic_en;
+// Tier C reset overlay arming: every reset re-arms (warm and cold -- a real
+// TWGS owns the reset vector always); the first instruction fetch from bank
+// $BC (the vector's JMPL $BCFA9A landing) disarms. With the card off this
+// never arms and the boot is bit-identical to a machine without the card.
+reg         twgs_boot_armed;
+always @(posedge CLK_14M) begin
+  if (reset)
+    twgs_boot_armed <= twgs_present;
+  else if (twgs_boot_armed && cpu_vpa && cpu_vda && bank_bef == 8'hBC)
+    twgs_boot_armed <= 1'b0;
+end
+
+// Phase 2 (WIP): CDA auto-install. STATUS: the NMI fires at the right moment
+// (2.5 s after the genuine handoff -- the countdown pauses while execution is
+// in bank $BC, so the firmware's own early $00FFFC read can't mistime it),
+// the tight vector overlay serves LFB24, and the LFA2F trampoline executes
+// fully (stack shuffle, hw-ack reads, RTI) -- but the RTI resumes the
+// INTERRUPTED code instead of detouring to LFA5D/_InstallCDA: the firmware's
+// stack-relative rewrite offsets assume the real 65C816's native interrupt
+// frame after PHB/PHA/PHA, and on this core the detour address lands off the
+// frame. Benign as-is (machine resumes correctly; no CDA in the menu).
+// NEXT: byte-compare our native-NMI stack frame + stack-relative addressing
+// against real-chip semantics through the LFA2F sequence (twgs.3.s:1954).
+// The firmware's chain-to-IIgs-ROM sequence
+// (LFB07) data-reads the real reset vector at $00FFFC from bank-$BC code --
+// a unique bus signature marking "boot handoff now". Arm a ~2.5 s deferral
+// there (Desk Manager is up well within that, ROM or GS/OS path alike),
+// then pulse NMI once. The card ROM's native NMI vector (overlaid tightly
+// by nmi_armed above) trampolines through LFA2F/LFA5D, which _InstallCDA's
+// the "TransWarp GS" desk accessory and resumes the interrupted code.
+// One-shot per reset, exactly like the real card's boot-time install.
+localparam TWGS_NMI_DELAY = 26'd35_795_453;   // 2.5 s at 14.318 MHz
+localparam TWGS_NMI_RETRY = 26'd34_363_636;   // retry 0.1 s after a miss
+reg  [1:0]  twgs_nmi_state;   // 0 idle, 1 timing, 2 vector window, 3 done
+reg  [25:0] twgs_nmi_cnt;
+reg  [6:0]  twgs_nmi_pulse;   // NMI_N low while nonzero
+reg  [3:0]  twgs_nmi_tries;
+reg  [15:0] twgs_nmi_win;     // vector-window timeout
+// Fetch-bank tracker: the chain signature must be a $00FFFC DATA read issued
+// by code EXECUTING in bank $BC (the firmware's LFB07 handoff) -- the CPU's
+// own vector pulls and the IIgs ROM's reads of the reset vector must not arm.
+reg  [7:0]  twgs_last_pbr;
+// Sample fetches ungated by phi2 with the CPU's raw address (the same
+// pattern as the proven ROM-debug PC tap): vpa/vda describe the live bus
+// cycle, not the phi2-committed snapshot.
+always @(posedge CLK_14M)
+  if (cpu_vpa && cpu_vda) twgs_last_pbr <= cpu_addr[23:16];
+`ifndef SYNTHESIS
+reg [7:0] twgs_lp_d; reg [7:0] twgs_lp_n;
+always @(posedge CLK_14M) begin
+  twgs_lp_d <= twgs_last_pbr;
+  if (twgs_last_pbr != twgs_lp_d && twgs_lp_n < 8'd40) begin
+    twgs_lp_n <= twgs_lp_n + 8'd1;
+    $display("TWGS-PBR: %02x -> %02x t=%0t", twgs_lp_d, twgs_last_pbr, $time);
+  end
+end
+`endif
+wire twgs_chain_sig = twgs_present && !twgs_boot_armed && phi2 &&
+                      cpu_vda && !cpu_vpa && !we &&
+                      bank_bef == 8'h00 && addr_bef == 16'hFFFC &&
+                      twgs_last_pbr == 8'hBC;
+always @(posedge CLK_14M) begin
+  if (reset) begin
+    twgs_nmi_state <= 2'd0;
+    twgs_nmi_cnt   <= 26'd0;
+    twgs_nmi_pulse <= 7'd0;
+    twgs_nmi_tries <= 4'd0;
+    twgs_nmi_win   <= 16'd0;
+  end else begin
+    if (twgs_nmi_pulse != 7'd0) twgs_nmi_pulse <= twgs_nmi_pulse - 7'd1;
+    case (twgs_nmi_state)
+      2'd0: if (twgs_chain_sig) begin
+              twgs_nmi_state <= 2'd1;
+              twgs_nmi_cnt   <= 26'd0;
+              twgs_nmi_tries <= 4'd0;
+            end
+      2'd1: begin
+`ifndef TWGS_CDA_INSTALL
+              // DISABLED pending the stack-frame fix:
+              // first hardware exposure showed the trampoline's mis-landing RTI is
+              // NOT benign outside the ROM3 sim case -- ROM1 boots crashed to the
+              // monitor (double BRK, X=$00BC). Hold in state 1 without counting;
+              // define TWGS_CDA_INSTALL to resume the phase-2 work.
+              twgs_nmi_cnt <= 26'd0;
+`else
+              // Count only while execution is OUTSIDE bank $BC: the firmware
+              // has an early $00FFFC sanity read too, but it keeps executing
+              // in $BC afterwards -- the countdown holds until the real
+              // handoff (after which the firmware never runs again), so the
+              // NMI lands 2.5 s into the IIgs ROM's own boot.
+              if (twgs_last_pbr != 8'hBC)
+                twgs_nmi_cnt <= twgs_nmi_cnt + 26'd1;
+              if (twgs_nmi_cnt == TWGS_NMI_DELAY) begin
+                twgs_nmi_state <= 2'd2;
+                twgs_nmi_pulse <= 7'd127;   // ~9 us low: clean edge
+                twgs_nmi_win   <= 16'd0;
+              end
+`endif
+            end
+      2'd2: begin
+              // Vector window: wait for the trampoline's JMPL to land in bank
+              // $BC. If the CPU was in emulation mode it pulled $FFFA (the
+              // real ROM handler; benign) and we missed -- retry shortly,
+              // giving up after 15 tries.
+              twgs_nmi_win <= twgs_nmi_win + 16'd1;
+              // Success = fetching the trampoline itself ($BCFA2F/LFA5D page)
+              if (cpu_vpa && cpu_vda && phi2 &&
+                  bank_bef == 8'hBC && addr_bef[15:8] == 8'hFA)
+                twgs_nmi_state <= 2'd3;
+              else if (twgs_nmi_win == 16'hFFFF) begin
+                if (twgs_nmi_tries == 4'd15)
+                  twgs_nmi_state <= 2'd3;   // give up
+                else begin
+                  twgs_nmi_tries <= twgs_nmi_tries + 4'd1;
+                  twgs_nmi_state <= 2'd1;
+                  twgs_nmi_cnt   <= TWGS_NMI_RETRY;
+                end
+              end
+            end
+      default: ;
+    endcase
+  end
+end
+wire twgs_nmi_armed = (twgs_nmi_state == 2'd2);
+`ifndef SYNTHESIS
+reg [1:0] twgs_nmi_state_d;
+always @(posedge CLK_14M) begin
+  twgs_nmi_state_d <= twgs_nmi_state;
+  if (twgs_nmi_state != twgs_nmi_state_d)
+    $display("TWGS-NMI: state %0d -> %0d t=%0t", twgs_nmi_state_d, twgs_nmi_state, $time);
+end
+`endif
+wire twgs_nmi_n     = (twgs_nmi_pulse == 7'd0);
+twgs_card twgs (
+    .clk(CLK_14M), .reset(reset),
+    .enable(twgs_present),
+    .bank(bank_bef), .addr(addr_bef),
+    .we(we), .phi2(phi2),
+    .vda(cpu_vda), .vpa(cpu_vpa),
+    .wr_data(dout),
+    .cyareg7(CYAREG[7]),
+    .turbo_code(host_speed),
+    .host_irq_en(osd_irq_delay),
+    .host_gfx_en(osd_twgs_gfx),
+    .host_snd_en(osd_twgs_snd),
+    .gfx_en(accel_twgs_gfx),
+    .snd_en(accel_twgs_snd),
+    .boot_armed(twgs_boot_armed),
+    .nmi_armed(twgs_nmi_armed),
+    .sel(twgs_sel), .dout(twgs_dout),
+    .accel_en(twgs_accel_en), .speed_code(twgs_speed_code),
+    .cfg_speed_code(twgs_cfg_speed),
+    .cache_enable(), .irq_logic_en(twgs_irq_logic_en),
+    .bk_addr(nv_addr[4:0]),
+    .bk_wr(nv_wr & nv_twgs_sel),
+    .bk_data(nv_din),
+    .bk_q(nv_twgs_q)
+);
+
+// Slot-ROM ($Cn00-$CnFF) timing when accelerated. Slots run at 1 MHz by
+// default -- the slot-7 SmartPort/HDD firmware (and slot ROM generally)
+// returns bad data if fetched at the accelerated rate, faulting the boot /
+// disk driver. The $C05C per-slot mask can only make a slot run at 1 MHz
+// (delay enabled); it cannot safely speed one up, so it never clears the
+// default-slow. (Making individual slots fast needs the slot-ROM fast path
+// debugged first -- tracked as future work.)
+wire       slot_delay_this = slot_ce;
+
+// Speed step for the clock divider: fast-cycle length = fast_thresh+1 ticks.
+// Only the fast cycle shortens; slow/sync (1 MHz) cycles are untouched, like
+// a real ZipGS/TWGS (I/O and Mega II accesses stay at stock speed).
+// accel_capable gates BOTH control paths (OSD and ZipGS software): on a
+// memory path that cannot sustain short cycles this must never leave native.
+// ZipGS IWM compatibility hold-off: a real accelerator drops to native speed
+// around floppy activity -- the IWM and the ROM disk drivers' cycle-counted
+// delays (spin-up, head settle) cannot be accelerated. Any CPU access to the
+// IWM ($C0E0-$C0EF) arms a ~2 ms native window, refreshed per access, so the
+// whole driver runs at the speed it was written for while the disk is being
+// worked, and acceleration resumes between disk phases. (Without this the
+// ROM3 3.5" driver mis-times the drive at 7.16 MHz: "Check startup device".)
+//
+// The 2 ms timer alone only covers gaps between IWM register touches; motor
+// spin-up and head-settle waits are plain CPU count-down loops that don't
+// touch $C0E0-$C0EF while waiting and can run well past 2 ms, so the timer
+// can lapse mid-delay and let acceleration resume before the loop is done --
+// desyncing the driver's cycle-counted timing regardless of ROM version or
+// which accelerated step is selected. floppy_motor_on/floppy35_motor_on
+// (rtl/iwm_woz.v) already track real motor state; gate on those too so
+// acceleration stays off for the drive's whole motor-on span, not just the
+// last 2 ms of register activity.
+reg [14:0] iwm_holdoff;
+always @(posedge CLK_14M) begin
+  if (reset)
+    iwm_holdoff <= 15'd0;
+  else if (phi2 && IO && addr_bef[7:4] == 4'hE)
+    iwm_holdoff <= 15'd28636;               // 2 ms at 14.318 MHz
+  else if (iwm_holdoff != 15'd0)
+    iwm_holdoff <= iwm_holdoff - 15'd1;
+end
+
+// Speaker + paddle transparent auto-slowdown (TransWarp/ZipGS behavior).
+// Timing-sensitive soft switches are cycle-counted by software loops AROUND the
+// access (a tone's pitch is the delay loop between $C030 toggles; a joystick
+// value is the count of a loop polling $C064 after a $C070 strobe). Slowing
+// only the I/O cycle itself does not fix them -- the loop must run at 1 MHz too.
+// So each access arms a retriggerable native-speed window (same mechanism as
+// iwm_holdoff). Without this the boot beep is ~8x too high and paddles peg when
+// accelerated. Unconditional: it only affects fast_thresh while accelerating.
+wire acc_spkr  = phi2 && IO && (addr_bef[7:0] == 8'h30);   // $C030 speaker toggle
+wire acc_ptrig = phi2 && IO && (addr_bef[7:4] == 4'h7);    // $C070-$C07F paddle trigger
+wire acc_pdl   = phi2 && IO && (addr_bef[7:2] == 6'h19);   // $C064-$C067 paddle read
+wire acc_ctr   = phi2 && IO && (addr_bef[7:1] == 7'h17);   // $C02E/$C02F video counter
+reg [15:0] beep_holdoff;
+reg [15:0] pdl_holdoff;
+reg [15:0] counter_holdoff;
+always @(posedge CLK_14M) begin
+  if (reset)                      beep_holdoff <= 16'd0;
+  else if (acc_spkr)              beep_holdoff <= 16'd28636;   // 2 ms @ 14.318 MHz
+  else if (beep_holdoff != 16'd0) beep_holdoff <= beep_holdoff - 16'd1;
+
+  if (reset)                      pdl_holdoff <= 16'd0;
+  else if (acc_ptrig | acc_pdl)   pdl_holdoff <= 16'd57272;    // 4 ms (full paddle scan)
+  else if (pdl_holdoff != 16'd0)  pdl_holdoff <= pdl_holdoff - 16'd1;
+
+  // ZipGS "Counter Delay" (SW1/4): 1 MHz around video-counter reads so the IIgs
+  // self-test 05 passes and beam-raced counter loops stay correctly timed.
+  if (reset)                         counter_holdoff <= 16'd0;
+  else if (acc_ctr)                  counter_holdoff <= 16'd14318; // 1 ms, retriggered by the poll loop
+  else if (counter_holdoff != 16'd0) counter_holdoff <= counter_holdoff - 16'd1;
+end
+// Per-window enables: the ZipGS register bits are the single source of truth
+// (the OSD toggles edge-apply into them via zipgs_regs host_* -- either UI can
+// flip them and both read back the same state). With the TWGS card selected
+// the windows are forced on: a real TransWarp's slowdowns are automatic and
+// non-configurable (per the TransWarp GS manual, ch.3).
+wire eff_spkr_en = twgs_present | zip_spkr_delay_en;
+wire eff_pdl_en  = twgs_present | zip_pdl_delay_en;
+wire eff_ctr_en  = twgs_present | zip_ctr_delay_en;
+wire io_slow_holdoff = (eff_spkr_en && beep_holdoff    != 16'd0) ||
+                       (eff_pdl_en  && pdl_holdoff     != 16'd0) ||
+                       (eff_ctr_en  && counter_holdoff != 16'd0);
+
+// One accelerator front-end at a time (a real machine holds one card): the
+// TWGS drives the engine when selected, otherwise the ZipGS state does --
+// which also carries the OSD-only turbo when no card is selected (the zip
+// host path stays live with the registers software-invisible).
+wire       eff_accel_en   = twgs_present ? twgs_accel_en   : zip_accel_en;
+wire [2:0] eff_speed_code = twgs_present ? twgs_speed_code : zip_speed_code;
+
+// Mirror outputs for the OSD status write-back: CONFIGURED state (what the
+// user/software set), not the live CYAREG-gated speed.
+assign accel_cfg_speed  = twgs_present ? twgs_cfg_speed : zip_speed_code;
+assign accel_spkr_delay = zip_spkr_delay_en;
+assign accel_pdl_delay  = zip_pdl_delay_en;
+assign accel_ctr_delay  = zip_ctr_delay_en;
+assign accel_cps_follow = zip_cps_follow_en;
+assign accel_irq_delay  = twgs_present ? twgs_irq_logic_en : zip_irq_delay_en;
+
+// AppleTalk/IRQ delay (ZipGS SW1/3 / TWGS Configure > AppleTalk/IRQ): drop to
+// the system speed while the CPU's interrupt-disable flag is set, so
+// timing-sensitive ISR-era code (AppleTalk et al) runs at the speed it
+// expects. Level-based, exactly the TWGS manual's description ("slows down
+// whenever the interrupts are disabled ... about a 5% decrease").
+wire irq_slowdown = cpu_i_flag &&
+                    (twgs_present ? twgs_irq_logic_en : zip_irq_delay_en);
+
+// CPS Follow ($C059 bit 3 = ZipGS SW1/5): when enabled, the accelerator drops
+// to native the moment the system enters 1 MHz mode (CYAREG bit7=0) --
+// authentic ZipGS behavior, needed for Open/Closed-Apple keys at boot/reset
+// and floppy. Making fast_thresh native here lets the existing clock_divider
+// slow_request (cyareg[7]==0 && !accel_active) take the CPU to 1 MHz.
+// Powers up OFF (zipgs_regs resets $C059.3 = 0, diverging from KEGS's $5F):
+// the Zip CDA's speed self-test clears CYAREG.7 while measuring -- verify the
+// CDA readout on real hardware before defaulting on. The TWGS needs no term
+// here: its accel_en already includes CYAREG.7 ("the TWGS will not override"
+// System Speed Normal -- manual ch.3).
+wire cps_gate = twgs_present ? 1'b1 : (CYAREG[7] || !zip_cps_follow_en);
+wire [3:0] fast_thresh = (accel_capable && eff_accel_en && eff_speed_code != 3'd0
+                          && iwm_holdoff == 15'd0
+                          && !floppy_motor_on && !floppy35_motor_on
+                          && !io_slow_holdoff
+                          && !irq_slowdown
+                          && !(twgs_present && (bank_bef == 8'hBC
+                                             ||  bank_bef[7:1] == 7'b1011111)) // TWGS card banks ($BC/$BE/$BF) native
+                          && !twgs_boot_armed                      // overlay window native
+                          && cps_gate)
+                         ? (4'd4 - {1'b0, eff_speed_code})
+                         : 4'd4;
+// accel_active also gates the top-level SDRAM read-path mux (Apple-IIgs.sv
+// accel_r): accel_r=1 selects the burst+cache line-buffer path, accel_r=0
+// the native single-word ch3 path the HDD DMA data pipeline is built for
+// ("the DMA data path is a 2-edge registered chain that corrupts below
+// 3-tick cycles"). dma_active/hdd_dma already forces
+// the CPU bus-cycle LENGTH back to native in clock_divider, but that never
+// fed back into accel_active, so a DMA transfer at any accelerated step
+// still serviced its reads through the accelerated cache path. Excluding
+// hdd_dma here keeps the read-path selection in sync with the cycle-length
+// forcing that already happens for DMA.
+assign accel_active = (fast_thresh != 4'd4) && !hdd_dma;
+
+// Clock divider instance
+clock_divider clk_div_inst (
+    .clk_14M(CLK_14M),
+    .cyareg(CYAREG),
+    .bank(bank),      // physical bank: aux-resolved, so E0/E1 (Mega II) cycles classify slow
+    .addr(addr_bef),  // logical address: soft-switch decode must not see the LC $Dxxx->$Cxxx A12 fold
+    .fast_thresh(fast_thresh),
+    .dma_active(hdd_dma),
+    .slot_access(slot_delay_this),
+    .zipregs_fast(zip_unlocked),
+    .shadow(shadow),
+    .IO(IO),
+    .we(we),
+    .valid(valid),
+    .is_rom_access(rom_ce),
+    .reset(reset),
+    .stretch(1'b0),  // legacy unused stretch input (superseded by ph0_*_vid below)
+    .disk_motor_hold(iwm_enbl && !DISK35[6]),  // 5.25" /ENBL (with mode-bit-2 holdover) keeps 1 MHz through spin-down
+    .ph0_phase_vid(PH0_PHASE_VID),  // VGC/Mega II PH0 phase (Stage 1: wired, not yet consumed)
+    .ph0_stb_vid(PH0_STB_VID),      // VGC/Mega II PH0 boundary strobe
+    .line_stb_vid(LINE_STB_VID),    // VGC/Mega II line-boundary strobe (PH0 grid anchor)
+    .clk_14M_en(),
+    .clk_7M_en(clk_7M_en),
+    .ph0_en(ph0_en),
+    .ph2_en(ph2_en),
+    .q3_en(q3_en),
+    .ph0_state(ph0_state),
+    .slow(slow),
+    .slowMem(slowMem)
+);
+// Map clock enables to Apple IIgs standard names
+assign phi2 = ph2_en;
+assign phi0 = ph0_en;
+wire ph0_en;
+wire ph2_en;
+wire clk_7M_en;
+assign clk_7M = clk_7M_en;
+wire q3_en;
+
+endmodule
