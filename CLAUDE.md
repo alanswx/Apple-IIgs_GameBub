@@ -12,8 +12,8 @@ and framework constraints, the block-RAM budget, the reuse list and the phases.
   is 4.204; don't use it.
 * `./mill root.compile` compiles the framework and our Chisel wrapper.
   `./mill root.buildCore --target gamebub_rev4` builds the bitstream (needs
-  Vivado 2023.2+, ideally 2025.2; avoid 2026.1, whose free tier needs a
-  yearly license file).
+  Vivado 2023.2+; this box has 2026.1 in `~/vivado`. 2026.1's free tier
+  needs a license file renewed yearly and limits the ILA).
 * References next to this repo: `../MacLC_GameBub` (the port we copy from),
   `../core-example` (official template), `../gamebub` (firmware and built-in
   cores).
