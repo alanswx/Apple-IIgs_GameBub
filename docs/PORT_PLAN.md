@@ -298,7 +298,10 @@ checked against the model. What it took:
   after phi2 at native speed (the gap between two CPU reads), so the worst
   case is 22 and 8.7 M CPU reads during track loading were all correct.
   With that the Arkanoid WOZ reaches the GS/OS loader in step with upstream
-  (frame 600-700). Sector loads match the image byte for byte.
+  (frame 600-700). Sector loads match the image byte for byte. A 2000-frame
+  run reaches Arkanoid's Taito "Fun Time Arcade" intro at frame 2000, the
+  same picture upstream's simulator shows there, with 62.5 M SDRAM reads,
+  62 M CPU reads and 4.2 MB of sector data all correct.
 
 ## 10. Open questions
 
