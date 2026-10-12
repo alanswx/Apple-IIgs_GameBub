@@ -282,7 +282,23 @@ checked against the model. What it took:
   margin is real but small: if hardware shows read errors, retune `TAPS`
   (about 76 ps each) first.
 * **Video window**: `vgc.sv` draws Super Hi-Res at H 44..683 and lines
-  19..218 of the 744 x 240 picture, so `CROP_X = 44`, `CROP_Y = 19`.
+  19..218 of the 744 x 240 picture, so `CROP_X = 44`, `CROP_Y = 19`
+  (checked on GS/OS's Super Hi-Res "Welcome to the IIgs" box).
+* **Floppy speed and the native CPU deadline.** Booting Arkanoid's WOZ, the
+  first block device (one SDRAM word per round trip, ~10 ms per track
+  load) let the ROM step ahead of the loads, and the boot ran off the disk
+  and was ejected; upstream's simulator, built from the same commit, reached
+  the GS/OS loader. ch2 reads are now burst-8 lines into their own register
+  (import patch), and `gb_blockdev` fetches a line ahead while sending
+  bytes (~75 us a sector). But a 19-cycle ch2 burst can make the CPU's
+  native ch3 read miss its fixed deadline (data within ~23 clk_mem of the
+  request; upstream's worst case is 21), which no data check sees: the
+  testbench now measures ch3 latency and compares the byte the CPU latches
+  at each phi2 with memory. `iigs_core` only starts a ch2 read 2 clk_sys
+  after phi2 at native speed (the gap between two CPU reads), so the worst
+  case is 22 and 8.7 M CPU reads during track loading were all correct.
+  With that the Arkanoid WOZ reaches the GS/OS loader in step with upstream
+  (frame 600-700). Sector loads match the image byte for byte.
 
 ## 10. Open questions
 

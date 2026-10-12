@@ -59,6 +59,7 @@ module iigs_core (
 	input  wire [15:0] pm_din,
 	output reg         pm_ack,
 	output reg  [15:0] pm_dout,
+	output reg [127:0] pm_line,          // a read returns the 8-word line at pm_addr & ~7
 
 	// ---- video (clk_vid domain, one pixel per ce_pix) ----
 	output wire [7:0]  vid_r,
@@ -368,7 +369,8 @@ module iigs_core (
 
 	// ---------------------------------------------------------------------
 	// ch2: the platform port. Level request in, toggle request out; ch2
-	// writes both bytes, a request with pm_we = 0 is a single-word read.
+	// writes both bytes, a request with pm_we = 0 is a burst read of the
+	// 8-word line holding pm_addr (import patch: sdram_burst dout2l).
 	// clk_mem is 8 x clk_sys from the same MMCM, so ack2/dout2 are sampled
 	// directly, as Apple-IIgs.sv does with up_ack.
 	// ---------------------------------------------------------------------
@@ -378,7 +380,24 @@ module iigs_core (
 	reg         up_wr;
 	reg  [15:0] up_din;
 	wire [15:0] up_dout;
+	wire [127:0] up_line;
 	reg         up_busy = 1'b0;
+
+	// At native speed the CPU's ch3 read has a fixed deadline (Apple-IIgs.sv:
+	// "data registered ~phi2+3, before the native sample point") and never
+	// stalls; upstream only ever delays it by a 9-cycle write or refresh
+	// round. A ch2 burst read is a 19-clk_mem round, so it may only start in
+	// the gap of a native CPU cycle (5 clk_sys): toggled at phi2+3, after this
+	// cycle's ch3 read, it ends by phi2+5.8, before the next one (phi2+6).
+	// Accelerated, the CPU stalls on a busy SDRAM, so any time is fine; with
+	// no CPU cycles at all (reset) the counter saturates and ch2 runs freely.
+	// It saturates only past the longest CPU cycle (27 ticks, clock_divider):
+	// a slow 1 MHz cycle must not open the slot just before a fast cycle's read.
+	reg  [4:0]  since_phi2 = 5'd31;
+	always @(posedge clk_sys)
+		if (phi2)                     since_phi2 <= 5'd0;
+		else if (since_phi2 != 5'd31) since_phi2 <= since_phi2 + 5'd1;
+	wire        ch2_slot = pm_we || accel_r || since_phi2 == 5'd2 || since_phi2 == 5'd31;
 
 	always @(posedge clk_sys) begin
 		if (~pll_locked) begin
@@ -389,10 +408,11 @@ module iigs_core (
 				up_busy <= 1'b0;
 				pm_ack  <= 1'b1;
 				pm_dout <= up_dout;
+				pm_line <= up_line;
 			end
 		end else if (pm_ack) begin
 			if (!pm_req) pm_ack <= 1'b0;
-		end else if (pm_req) begin
+		end else if (pm_req && ch2_slot) begin
 			up_addr <= pm_addr;
 			up_wr   <= pm_we;
 			up_din  <= pm_din;
@@ -413,7 +433,7 @@ module iigs_core (
 		.init(~pll_locked), .clk(clk_mem),
 		.addr0(wr_addr), .wrl0(wr_wrl), .wrh0(wr_wrh), .din0(wr_din), .dout0(), .req0(wr_req), .ack0(wr_ack),
 		.addr1(rd_addr), .wrl1(1'b0), .wrh1(1'b0), .din1(16'd0), .dout1(rd_line), .req1(rd_req), .ack1(rd_ack),
-		.addr2(up_addr), .wrl2(up_wr), .wrh2(up_wr), .din2(up_din), .dout2(up_dout), .req2(up_req), .ack2(up_ack),
+		.addr2(up_addr), .wrl2(up_wr), .wrh2(up_wr), .din2(up_din), .dout2(up_dout), .dout2l(up_line), .req2(up_req), .ack2(up_ack),
 		.addr3(nat_addr), .dout3(nat_dout), .req3(nat_req), .ack3(nat_ack)
 	);
 

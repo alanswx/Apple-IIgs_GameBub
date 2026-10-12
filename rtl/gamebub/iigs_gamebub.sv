@@ -177,6 +177,7 @@ module iigs_gamebub (
 	wire        bd_sd_req, bd_sd_we, bd_sd_ack;
 	wire [23:0] bd_sd_addr;
 	wire [15:0] bd_sd_din, bd_sd_dout;
+	wire [127:0] pm_line;
 
 	gb_blockdev blockdev (
 		.clk          (clk_sys),
@@ -201,6 +202,7 @@ module iigs_gamebub (
 		.mem_din      (bd_sd_din),
 		.mem_ack      (bd_sd_ack),
 		.mem_dout     (bd_sd_dout),
+		.mem_line     (pm_line),
 		.dbg          (dbg_blockdev)
 	);
 
@@ -319,6 +321,7 @@ module iigs_gamebub (
 		.pm_din              (pm_din),
 		.pm_ack              (pm_ack),
 		.pm_dout             (pm_dout),
+		.pm_line             (pm_line),
 		.vid_r               (vid_r),
 		.vid_g               (vid_g),
 		.vid_b               (vid_b),

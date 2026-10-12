@@ -64,6 +64,7 @@ module sdram_burst #(
     // ch2: single-word write (upload)
     input      [24:1] addr2, input wrl2, input wrh2, input [15:0] din2,
     output     [15:0] dout2, input req2, output reg ack2,
+    output     [127:0] dout2l,  // [gamebub] ch2 burst read line
     // ch3: single-word read (native-speed CPU reads, early ack)
     input      [24:1] addr3,
     output     [15:0] dout3, input req3, output reg ack3
@@ -85,8 +86,9 @@ module sdram_burst #(
     reg [15:0]  dq_in;   // IO-cell input capture register (see burst-beat capture)
     assign dout0 = 16'd0;
     assign dout1 = line;
-    reg [15:0]  word2;   // [gamebub] ch2 single-word read capture
-    assign dout2 = word2;
+    reg [127:0] line2;   // [gamebub] ch2 burst read line
+    assign dout2l = line2;
+    assign dout2 = 16'd0;
     assign dout3 = word3;
 
     localparam BURST_CODE     = 3'b011;       // burst length 8 (reads)
@@ -163,7 +165,7 @@ module sdram_burst #(
                 cur <= addr1; wdqm <= 2'b00;
                 active <= 1; we <= 0; is_read <= 1; serving <= 2'd1; state <= STATE_START;
             end else if (ack2 != req2) begin
-                // [gamebub] no byte enable = single-word read
+                // [gamebub] no byte enable = burst-8 line read (into line2)
                 cur <= addr2; wdata <= din2; wdqm <= (wrh2 | wrl2) ? ~{wrh2,wrl2} : 2'b00;
                 active <= 1; we <= wrh2 | wrl2; is_read <= ~(wrh2 | wrl2); serving <= 2'd2; state <= STATE_START;
             end else if (rfs) begin
@@ -186,6 +188,10 @@ module sdram_burst #(
         if (mode == MODE_NORMAL && is_read && serving == 2'd1
             && state >= STATE_LDAT0 && state <= STATE_LDATL)
             line[ {(state - STATE_LDAT0), 4'b0} +: 16 ] <= dq_in;
+        // [gamebub] ch2 burst read beats
+        if (mode == MODE_NORMAL && is_read && serving == 2'd2
+            && state >= STATE_LDAT0 && state <= STATE_LDATL)
+            line2[ {(state - STATE_LDAT0), 4'b0} +: 16 ] <= dq_in;
 
         // ch3 single-word read: the READ was issued at the requested column,
         // so the FIRST beat is the requested word -- capture and ack early.
@@ -193,15 +199,11 @@ module sdram_burst #(
             word3 <= dq_in;
             ack3  <= req3;
         end
-        // [gamebub] ch2 single-word read, captured like ch3's
-        if (mode == MODE_NORMAL && is_read && serving == 2'd2 && state == STATE_LDAT0) begin
-            word2 <= dq_in;
-            ack2  <= req2;
-        end
 
         // completion acks
         if (mode == MODE_NORMAL && active) begin
             if (is_read && serving == 2'd1 && state == STATE_LDATL) ack1 <= req1;
+            if (is_read && serving == 2'd2 && state == STATE_LDATL) ack2 <= req2;  // [gamebub]
             if (we && state == STATE_CONT) begin
                 if (serving == 2'd0) ack0 <= req0;
                 else                 ack2 <= req2;
@@ -238,7 +240,7 @@ module sdram_burst #(
                 // reads: ch1 line-aligned (burst walks the 8-word line); ch3
                 // at the requested column (first beat = requested word)
                 STATE_CONT:  SDRAM_A <= we             ? {wdqm, 2'b10, cur_col} :
-                                        serving[1]      ? {2'b00, 2'b10, cur_col}  // [gamebub] ch2/ch3: exact column
+                                        serving == 2'd3 ? {2'b00, 2'b10, cur_col}
                                                         : {2'b00, 2'b10, cur_col[8:3], 3'b000};
                 default: ;
             endcase

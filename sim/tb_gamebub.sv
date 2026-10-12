@@ -237,8 +237,8 @@ module tb_gamebub #(
 		rp_v[1] <= v; rp_a[1] <= a;
 	end
 
-	// Read-back check: every ch3 (native CPU) and ch2 (host/blockdev) single
-	// read must return what the array holds at that word.
+	// Read-back check: every ch3 (native CPU) word read and ch2 (block
+	// device) line read must return what the array holds.
 	integer rd_checks = 0, rd_bad = 0;
 	reg     ack3_d = 1'b0, ack2_d = 1'b0;
 	always @(posedge dut.core.clk_mem) begin
@@ -253,15 +253,105 @@ module tb_gamebub #(
 					         dut.core.sdram.addr3, dut.core.sdram.word3, sdram[dut.core.sdram.addr3], $time);
 			end
 		end
-		if (dut.core.sdram.ack2 != ack2_d && !(dut.core.sdram.wrl2 || dut.core.sdram.wrh2)) begin
+		if (dut.core.sdram.ack2 != ack2_d && !(dut.core.sdram.wrl2 || dut.core.sdram.wrh2)) begin : ch2_line
+			reg [23:0] base;
+			base = {dut.core.sdram.addr2[24:4], 3'b000};
 			rd_checks = rd_checks + 1;
-			if (dut.core.sdram.word2 !== sdram[dut.core.sdram.addr2]) begin
-				rd_bad = rd_bad + 1;
-				if (rd_bad <= 10)
-					$display("TB ERROR: ch2 read %06h got %04h, SDRAM holds %04h @%0t",
-					         dut.core.sdram.addr2, dut.core.sdram.word2, sdram[dut.core.sdram.addr2], $time);
+			for (int k = 0; k < 8; k++)
+				if (dut.core.sdram.line2[k*16 +: 16] !== sdram[base + k]) begin
+					rd_bad = rd_bad + 1;
+					if (rd_bad <= 10)
+						$display("TB ERROR: ch2 line %06h word %0d got %04h, SDRAM holds %04h @%0t",
+						         base, k, dut.core.sdram.line2[k*16 +: 16], sdram[base + k], $time);
+				end
+		end
+	end
+
+	// Native read latency: clk_mem cycles from a ch3 request to its data. At
+	// native speed the CPU latches it 3 clk_sys (24 clk_mem) after the
+	// request whatever happens, so anything near 24 is a wrong byte the
+	// data check above cannot see.
+	integer nat_lat = 0, nat_lat_max = 0, nat_late = 0;
+	reg     req3_d = 1'b0, nat_wait = 1'b0;
+	reg [4:0] nat_st0;
+	reg [1:0] nat_sv0;
+	reg       nat_act0;
+	reg [4:0] nat_since0;
+	always @(posedge dut.core.clk_mem) begin
+		req3_d <= dut.core.sdram.req3;
+		if (dut.core.sdram.req3 != req3_d) begin
+			nat_wait <= 1'b1; nat_lat <= 1;
+			nat_st0 <= dut.core.sdram.state; nat_sv0 <= dut.core.sdram.serving;
+			nat_act0 <= dut.core.sdram.active; nat_since0 <= dut.core.since_phi2;
+		end
+		else if (nat_wait) begin
+			nat_lat <= nat_lat + 1;
+			if (dut.core.sdram.ack3 == dut.core.sdram.req3) begin
+				nat_wait <= 1'b0;
+				if (nat_lat > nat_lat_max) nat_lat_max <= nat_lat;
+				if (nat_lat > 22) begin
+					nat_late <= nat_late + 1;
+					if (nat_late < 12) $display("TB ERROR: native read took %0d clk_mem cycles (at request: state %0d serving %0d active %0d since_phi2 %0d) @%0t",
+					                            nat_lat, nat_st0, nat_sv0, nat_act0, nat_since0, $time);
+				end
 			end
 		end
+	end
+
+	// What the CPU really sees at native speed: on the half cycle before each
+	// phi2 latch, the byte iigs_core presents for this cycle's ch3 read
+	// (nat_data) must be the one in memory. Catches late reads directly.
+	integer cpu_reads = 0, cpu_bad = 0;
+	reg     nat_req_n = 1'b0, nat_pend = 1'b0;
+	always @(negedge clk_sys) begin
+		if (dut.core.nat_req != nat_req_n) begin
+			nat_req_n <= dut.core.nat_req;
+			nat_pend  <= 1'b1;
+		end else if (dut.core.phi2 && nat_pend) begin : cpu_latch
+			reg [15:0] wd;
+			nat_pend <= 1'b0;
+			wd = sdram[dut.core.nat_addr];
+			cpu_reads = cpu_reads + 1;
+			if (dut.core.nat_data !== (dut.core.nat_bsel ? wd[15:8] : wd[7:0])) begin
+				cpu_bad = cpu_bad + 1;
+				if (cpu_bad <= 10)
+					$display("TB ERROR: CPU latched %02h from %06h.%0d, memory holds %04h @%0t",
+					         dut.core.nat_data, dut.core.nat_addr, dut.core.nat_bsel, wd, $time);
+			end
+		end
+	end
+
+	// Block device check: every byte gb_blockdev hands the floppy controller
+	// must be the disk image's byte at lba * 512 + offset (the disk is the
+	// last file loaded, so filebuf still holds it). +trace_bd lists sectors.
+	integer bd_bytes = 0, bd_bad = 0, bd_writes = 0;
+	bit     bd_check = 1'b0;
+	reg     bd_rd_d = 1'b0, bd_wr_d = 1'b0;
+	always @(posedge clk_sys) begin
+		bd_rd_d <= dut.sd_rd;
+		bd_wr_d <= dut.sd_wr;
+		if (dut.sd_rd && !bd_rd_d && $test$plusargs("trace_bd"))
+			$display("TB BD: read lba %0d frame %0d", dut.sd_lba, frame);
+		if (dut.sd_wr && !bd_wr_d) begin
+			bd_writes = bd_writes + 1;
+			$display("TB BD: WRITE lba %0d frame %0d", dut.sd_lba, frame);
+		end
+		if (bd_check && !dut.disk_sel && dut.sd_ack && dut.sd_buff_wr) begin
+			bd_bytes = bd_bytes + 1;
+			if (dut.sd_buff_dout !== filebuf[dut.sd_lba * 512 + dut.sd_buff_addr]) begin
+				bd_bad = bd_bad + 1;
+				if (bd_bad <= 10)
+					$display("TB ERROR: blockdev lba %0d byte %0d = %02h, image has %02h @%0t", dut.sd_lba,
+					         dut.sd_buff_addr, dut.sd_buff_dout, filebuf[dut.sd_lba * 512 + dut.sd_buff_addr], $time);
+			end
+		end
+	end
+
+	reg eject_d = 1'b0;
+	always @(posedge clk_sys) begin
+		eject_d <= dut.core.drive35_eject_req;
+		if (dut.core.drive35_eject_req && !eject_d)
+			$display("TB: 3.5\" EJECT requested at frame %0d, cpu=%06h", frame, dut.dbg_addr);
 	end
 
 	// -------------------------------------------------------------------
@@ -493,9 +583,9 @@ module tb_gamebub #(
 				if (frame_rows_bad < 5) $display("TB WARNING: frame %0d had %0d rows", frame, fy);
 			end
 			if (frame % 10 == 0) begin
-				$display("TB: frame %0d host=%08h cpu=%06h cpu_reset=%0d disk=%04b bd=%08h sdram rd=%0d wr=%0d checks=%0d bad=%0d audio=%0d",
+				$display("TB: frame %0d host=%08h cpu=%06h cpu_reset=%0d disk=%04b bd=%08h (%0d bytes checked, %0d bad) native max %0d late %0d cpu %0d/%0d bad sdram rd=%0d wr=%0d checks=%0d bad=%0d audio=%0d",
 				         frame, dut.dbg_host_state, dut.dbg_addr, dut.dbg_core_reset, dut.dbg_disk,
-				         dut.dbg_blockdev, sdram_reads, sdram_writes, rd_checks, rd_bad, audio_peak);
+				         dut.dbg_blockdev, bd_bytes, bd_bad, nat_lat_max, nat_late, cpu_bad, cpu_reads, sdram_reads, sdram_writes, rd_checks, rd_bad, audio_peak);
 				audio_peak = 0;
 				$fflush;
 			end
@@ -643,6 +733,7 @@ module tb_gamebub #(
 		if (rom01_path != "") load_file(3, rom01_path, 32'h10F8_0000, len);
 		if (disk_path != "")  load_file(0, disk_path,  32'h1100_0000, len);
 		if (disk2_path != "") load_file(1, disk2_path, 32'h1140_0000, len);
+		bd_check = (disk_path != "" && disk2_path == "");
 		if ($test$plusargs("stop_after_load")) begin
 			$display("TB: +stop_after_load, done");
 			$finish;

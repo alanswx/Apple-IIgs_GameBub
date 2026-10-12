@@ -251,44 +251,55 @@ def patch_es5503(text, src):
 
 
 def patch_sdram_ch2_read(text):
-    """Single-word reads on ch2 (wrl2 = wrh2 = 0), like ch3's.
+    """Burst-8 line reads on ch2 (wrl2 = wrh2 = 0), like ch1's.
 
     On MiSTer ch2 only receives the HPS ROM upload. On Game Bub every file
     (ROMs, WOZ images) arrives through it, and the floppy block device, which
     MiSTer's hps_io served from the SD card, reads and writes the disk images
-    in SDRAM through it too (rtl/gamebub/iigs_core.sv). The CPU channels and
-    their priority are untouched: ch2 stays last.
+    in SDRAM through it too (rtl/gamebub/iigs_core.sv). A ch2 read is a
+    burst-8 line read like ch1's, into its own 128-bit register (new port
+    dout2l), acked at the last beat: one word per round trip made a track load
+    (~38 sectors) take ~10 ms, too slow for the ROM's step-and-read seeks.
+    (Sharing ch1's `line` is not safe: sdram_cache copies it a synchronizer
+    delay after ack1, and a ch2 burst could overwrite it first.) The CPU
+    channels and their priority are untouched: ch2 stays last.
     """
-    text = replace_once(text, "    assign dout2 = 16'd0;\n",
-                        "    reg [15:0]  word2;   // [gamebub] ch2 single-word read capture\n"
-                        "    assign dout2 = word2;\n", "sdram_burst dout2")
+    text = replace_once(
+        text,
+        "    output     [15:0] dout2, input req2, output reg ack2,\n",
+        "    output     [15:0] dout2, input req2, output reg ack2,\n"
+        "    output     [127:0] dout2l,  // [gamebub] ch2 burst read line\n",
+        "sdram_burst dout2l port")
+    text = replace_once(
+        text,
+        "    assign dout1 = line;\n",
+        "    assign dout1 = line;\n"
+        "    reg [127:0] line2;   // [gamebub] ch2 burst read line\n"
+        "    assign dout2l = line2;\n",
+        "sdram_burst line2")
     text = replace_once(
         text,
         "                cur <= addr2; wdata <= din2; wdqm <= ~{wrh2,wrl2};\n"
         "                active <= 1; we <= 1; is_read <= 0; serving <= 2'd2; state <= STATE_START;\n",
-        "                // [gamebub] no byte enable = single-word read\n"
+        "                // [gamebub] no byte enable = burst-8 line read (into line2)\n"
         "                cur <= addr2; wdata <= din2; wdqm <= (wrh2 | wrl2) ? ~{wrh2,wrl2} : 2'b00;\n"
         "                active <= 1; we <= wrh2 | wrl2; is_read <= ~(wrh2 | wrl2); serving <= 2'd2; state <= STATE_START;\n",
         "sdram_burst ch2 dispatch")
     text = replace_once(
         text,
-        "            word3 <= dq_in;\n"
-        "            ack3  <= req3;\n"
-        "        end\n",
-        "            word3 <= dq_in;\n"
-        "            ack3  <= req3;\n"
-        "        end\n"
-        "        // [gamebub] ch2 single-word read, captured like ch3's\n"
-        "        if (mode == MODE_NORMAL && is_read && serving == 2'd2 && state == STATE_LDAT0) begin\n"
-        "            word2 <= dq_in;\n"
-        "            ack2  <= req2;\n"
-        "        end\n",
-        "sdram_burst ch2 read capture")
+        "            line[ {(state - STATE_LDAT0), 4'b0} +: 16 ] <= dq_in;\n",
+        "            line[ {(state - STATE_LDAT0), 4'b0} +: 16 ] <= dq_in;\n"
+        "        // [gamebub] ch2 burst read beats\n"
+        "        if (mode == MODE_NORMAL && is_read && serving == 2'd2\n"
+        "            && state >= STATE_LDAT0 && state <= STATE_LDATL)\n"
+        "            line2[ {(state - STATE_LDAT0), 4'b0} +: 16 ] <= dq_in;\n",
+        "sdram_burst line2 capture")
     return replace_once(
         text,
-        "                                        serving == 2'd3 ? {2'b00, 2'b10, cur_col}\n",
-        "                                        serving[1]      ? {2'b00, 2'b10, cur_col}  // [gamebub] ch2/ch3: exact column\n",
-        "sdram_burst read column")
+        "            if (is_read && serving == 2'd1 && state == STATE_LDATL) ack1 <= req1;\n",
+        "            if (is_read && serving == 2'd1 && state == STATE_LDATL) ack1 <= req1;\n"
+        "            if (is_read && serving == 2'd2 && state == STATE_LDATL) ack2 <= req2;  // [gamebub]\n",
+        "sdram_burst ch2 line ack")
 
 
 def patch_sdram_burst(text, src):
