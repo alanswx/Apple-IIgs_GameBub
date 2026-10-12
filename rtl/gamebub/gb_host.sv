@@ -82,6 +82,7 @@ module gb_host (
 	input  wire  [7:0] db_mouse,         // pointer steps {fast, slow}, 0 no preference
 	output wire  [7:0] mouse_steps,      // pointer steps {fast, slow}, 0 = default
 	output wire  [2:0] doc_gain,         // music volume: DOC x(1 << doc_gain)
+	output wire        disk_light,       // draw the drive light (gb_disk_light)
 
 	// ---- file table ----
 	output reg   [4:0] file_present,
@@ -132,27 +133,32 @@ module gb_host (
 	localparam [11:0] SET_PTR_DEFAULT = 12'h208;  // 0 keyboard, 1 mouse, 2 = auto
 	localparam [11:0] SET_MOUSE       = 12'h20C;  // pointer steps {fast, slow}, 0 = auto
 	localparam [11:0] SET_VOLUME      = 12'h210;  // DOC gain shift 2..5 (2 = upstream)
+	localparam [11:0] SET_DISK_LIGHT  = 12'h214;  // 1 = show the drive light
 
 	reg  [31:0] set_rom         = 32'd0;
 	reg  [31:0] set_speed       = 32'hF;
 	reg  [31:0] set_ptr_default = 32'd2;
 	reg  [31:0] set_mouse       = 32'd0;
 	reg  [31:0] set_volume      = 32'd4;
+	reg  [31:0] set_disk_light  = 32'd1;
 
 	// "Auto" settings take the game database's choice for this disk
-	// (gb_gamedb), else: ROM 3 if the card has it, else ROM 01; normal
-	// speed; mouse mode.
+	// (gb_gamedb), else: ROM 01 if the card has it (the ROM most games
+	// were written for; none of the WOZ collection's IIgs titles needs
+	// ROM 3), else ROM 3; normal speed; mouse mode.
 	wire db_rom3  = db_found && db_rom == 2'd1 && file_present[FILE_ROM3];
 	wire db_rom01 = db_found && db_rom == 2'd2 && file_present[FILE_ROM01];
 	assign rom_select  = (set_rom[1:0] == 2'd2) ||
-	                     (set_rom[1:0] == 2'd0 && !db_rom3 &&
-	                      (db_rom01 || (!file_present[FILE_ROM3] && file_present[FILE_ROM01])));
+	                     (set_rom[1:0] == 2'd0 && !db_rom3 && file_present[FILE_ROM01]);
+	// (The accelerator already runs at native speed while a drive motor is
+	// on -- iigs.sv fast_thresh -- so a faster CPU cannot speed disk reads.)
 	assign host_speed  = (set_speed[3:0] == 4'hF) ?
 	                         ((db_found && db_speed <= 8'd4) ? db_speed[2:0] : 3'd0) :
 	                     (set_speed[2:0] > 3'd4) ? 3'd4 : set_speed[2:0];
 	assign ptr_default = (set_ptr_default[1:0] == 2'd2) ?
 	                         ((db_found && db_input <= 8'd1) ? db_input[0] : 1'b1) :
 	                     set_ptr_default[0];
+	assign disk_light  = set_disk_light[0];
 	assign doc_gain    = (set_volume[2:0] < 3'd2) ? 3'd2 : (set_volume[2:0] > 3'd5) ? 3'd5 : set_volume[2:0];
 	assign mouse_steps = (set_mouse[7:0] == 8'd0) ? (db_found ? db_mouse : 8'd0) : set_mouse[7:0];
 
@@ -226,6 +232,7 @@ module gb_host (
 			SET_PTR_DEFAULT:  local_read = set_ptr_default;
 			SET_MOUSE:        local_read = set_mouse;
 			SET_VOLUME:       local_read = set_volume;
+			SET_DISK_LIGHT:   local_read = set_disk_light;
 			12'h800:          local_read = 32'h49494753;   // "IIGS"
 			12'h804:          local_read = dbg_state;
 			12'h808:          local_read = woz_magic;
@@ -305,6 +312,7 @@ module gb_host (
 							SET_PTR_DEFAULT: set_ptr_default <= mem_dataWrite;
 							SET_MOUSE:       set_mouse       <= mem_dataWrite;
 							SET_VOLUME:      set_volume      <= mem_dataWrite;
+							SET_DISK_LIGHT:  set_disk_light  <= mem_dataWrite;
 							default: ;
 						endcase
 					end else begin

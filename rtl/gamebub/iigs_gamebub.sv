@@ -113,6 +113,8 @@ module iigs_gamebub (
 	wire  [1:0] db_rom;
 	wire  [7:0] db_speed, db_input, db_mouse, mouse_steps;
 	wire  [2:0] doc_gain;
+	wire        disk_light;
+	wire [3:0]  dbg_disk;             // iigs_core: {motor, busy, ready, mounted}
 	wire [31:0] db_crc;
 	wire [62:0] db_keymap;
 
@@ -155,6 +157,7 @@ module iigs_gamebub (
 		.db_mouse       (db_mouse),
 		.mouse_steps    (mouse_steps),
 		.doc_gain       (doc_gain),
+		.disk_light     (disk_light),
 		.file_present   (file_present),
 		.file_size_flat (file_size_flat),
 		.dbg_blockdev   (dbg_blockdev),
@@ -367,7 +370,6 @@ module iigs_gamebub (
 	);
 	wire [23:0] dbg_addr;
 	wire        dbg_core_reset;
-	wire [3:0]  dbg_disk;
 
 	iigs_core core (
 		.clk_sys             (clk_sys),
@@ -429,6 +431,8 @@ module iigs_gamebub (
 	// ---------------------------------------------------------------------
 	// Video
 	// ---------------------------------------------------------------------
+	wire [2:0] vo_r, vo_g, vo_b;
+	wire       vo_de, vo_hblank, vo_vblank;
 	gb_video_out video (
 		.clk        (clk_sys),
 		.reset      (reset || core_reset),
@@ -437,6 +441,25 @@ module iigs_gamebub (
 		.in_b       (vid_b),
 		.in_hblank  (vid_hblank),
 		.in_vblank  (vid_vblank),
+		.out_r      (vo_r),
+		.out_g      (vo_g),
+		.out_b      (vo_b),
+		.out_de     (vo_de),
+		.out_hblank (vo_hblank),
+		.out_vblank (vo_vblank)
+	);
+
+	// The 3.5" drive's "in use" light, drawn into the frame (no core LED).
+	gb_disk_light disk_lamp (
+		.clk        (clk_sys),
+		.enable     (disk_light),
+		.lit        (dbg_disk[3]),       // drive motor on
+		.in_r       (vo_r),
+		.in_g       (vo_g),
+		.in_b       (vo_b),
+		.in_de      (vo_de),
+		.in_hblank  (vo_hblank),
+		.in_vblank  (vo_vblank),
 		.out_r      (video_data_r),
 		.out_g      (video_data_g),
 		.out_b      (video_data_b),

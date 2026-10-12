@@ -22,7 +22,7 @@
 			"default": "0x0",
 			"items": [
 				{
-					"label": "Auto (game list)",
+					"label": "Auto (game list, else ROM 01)",
 					"value": "0x0"
 				},
 				{
@@ -144,6 +144,23 @@
 				{
 					"label": "Loudest (x32, may clip)",
 					"value": "0x5"
+				}
+			]
+		},
+		{
+			"id": 7,
+			"label": "Disk Light",
+			"address": "0x00000214",
+			"type": "list",
+			"default": "0x1",
+			"items": [
+				{
+					"label": "On (top right)",
+					"value": "0x1"
+				},
+				{
+					"label": "Off",
+					"value": "0x0"
 				}
 			]
 		}

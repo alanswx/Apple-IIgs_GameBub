@@ -3,6 +3,7 @@
 
     python3 tools/mkgamedb.py [games.tsv] [-o build/gamedb.bin]
     python3 tools/mkgamedb.py --crc disk.woz ...   # print the lookup key
+    python3 tools/mkgamedb.py --seed DIR ...       # add unlisted 3.5" disks
 
 Copy gamedb.bin into the core's folder on the SD card next to rom3.rom
 (files.json file 4). Adding a game needs no Vivado run.
@@ -155,13 +156,56 @@ def build(rows):
     return out
 
 
+def woz_meta(data):
+    """The WOZ META chunk as a dict ({} if there is none)."""
+    p = 12
+    while p + 8 <= len(data):
+        cid, n = data[p:p + 4], struct.unpack_from('<I', data, p + 4)[0]
+        if cid == b'META':
+            text = data[p + 8:p + 8 + n].decode('utf-8', 'replace')
+            return dict(l.split('\t', 1) for l in text.split('\n') if '\t' in l)
+        p += 8 + n
+    return {}
+
+
+def seed(tsv, dirs):
+    """Append a row for each 3.5" WOZ under dirs whose CRC is not listed:
+    the META title, and ROM 01 where requires_rom rules ROM 3 out."""
+    listed = {int(r['crc32'], 16) for _, r in read_tsv(tsv)}
+    rows = []
+    for d in dirs:
+        for f in sorted(Path(d).rglob('*.woz')):
+            data = f.read_bytes()
+            if data[:4] not in (b'WOZ1', b'WOZ2') or data[21] != 2:
+                continue                                  # 5.25" (INFO disk type 1)
+            crc = struct.unpack_from('<I', data, 8)[0]
+            if crc in listed:
+                continue
+            listed.add(crc)
+            meta = woz_meta(data)
+            req = meta.get('requires_rom', '').replace(' ', '').lower()
+            rom = 'rom01' if req.startswith('iigsrom') and '3' not in req else '-'
+            title = (meta.get('title') or f.stem).replace('\t', ' ')
+            side = meta.get('side', '')
+            if side:
+                title += f' ({side})'
+            note = f'requires_rom: {meta["requires_rom"]}' if 'requires_rom' in meta else ''
+            rows.append(f'{crc:08x}\t{title}\t{rom}\t-\t-\t-\t-\t{note}\n')
+    with open(tsv, 'a') as fh:
+        fh.writelines(rows)
+    print(f'{tsv}: added {len(rows)} disks')
+
+
 def main():
     root = Path(__file__).resolve().parent.parent
     ap = argparse.ArgumentParser(description=__doc__.split('\n')[0])
     ap.add_argument('tsv', nargs='?', default=root / 'gamedb' / 'games.tsv')
     ap.add_argument('-o', '--out', default=root / 'build' / 'gamedb.bin')
     ap.add_argument('--crc', nargs='+', metavar='WOZ', help='print WOZ lookup keys and exit')
+    ap.add_argument('--seed', nargs='+', metavar='DIR', help='append unlisted 3.5" disks under DIR')
     a = ap.parse_args()
+    if a.seed:
+        seed(a.tsv, a.seed)
     if a.crc:
         for f in a.crc:
             print(f'{woz_crc(f):08x}\t{Path(f).name}')

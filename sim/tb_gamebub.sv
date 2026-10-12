@@ -26,6 +26,7 @@
 //   +mouse=<hex>    d-pad pointer steps setting {fast, slow}, 0 = auto
 //   +trace_mouse    print each pointer report the pad sends
 //   +volume=<n>     Music Volume setting: DOC x(1 << n), 2..5 (default 4)
+//   +disk_light=<n> Disk Light setting: 1 on (default), 0 off
 //   +frames=<n>     stop after n frames (default 300)
 //   +dump=<k>       write every k-th frame (default 25)
 //   +raw            also dump the VGC's raw output (whole line, border included)
@@ -773,6 +774,7 @@ module tb_gamebub #(
 		if ($test$plusargs("kbd_mode"))         mem_write(32'h0000_0208, 32'd0);
 		if ($value$plusargs("mouse=%h", speed)) mem_write(32'h0000_020C, speed);
 		if ($value$plusargs("volume=%d", speed)) mem_write(32'h0000_0210, speed);
+		if ($value$plusargs("disk_light=%d", speed)) mem_write(32'h0000_0214, speed);
 
 		if (rom3_path != "")  load_file(2, rom3_path,  32'h10FC_0000, len);
 		if (rom01_path != "") load_file(3, rom01_path, 32'h10F8_0000, len);

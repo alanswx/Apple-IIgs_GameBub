@@ -1,8 +1,9 @@
 # Per-game settings for the Apple IIgs Game Bub core. tools/mkgamedb.py turns
 # this into gamedb.bin. Tab-separated; "-" = default. Lookup key: the WOZ
 # header CRC32 (tools/mkgamedb.py --crc disk.woz prints it).
-#   rom      auto | rom3 | rom01
-#   speed    - | 2.8 | 3.6 | 4.8 | 7.2 | 14.3   (MHz; "-" leaves the menu setting)
+#   rom      - | rom3 | rom01   ("-" = ROM 01 if the card has it, else ROM 3)
+#   speed    - | 2.8 | 3.6 | 4.8 | 7.2 | 14.3   (MHz; "-" = 2.8. The CPU drops to
+#            native speed while the drive runs, so this cannot speed loading.)
 #   input    - | mouse | keyboard              (mode at start; Select toggles)
 #   mouse    - | N | S-F   d-pad pointer speed, mouse units per 1/100 s:
 #            N steady, or S for the first 0.4 s of a hold then F (1..15).
@@ -12,4 +13,359 @@
 #            Unlisted buttons keep the defaults: a=return b=space x=esc y=y
 #            l=oa r=option start=return. In mouse mode A is the mouse button.
 crc32	title	rom	speed	input	mouse	buttons	notes
-ea115ce2	Arkanoid (Taito)	rom3	-	mouse	4	-	plays on hardware (ROM 3); WOZ META says ROM1
+ea115ce2	Arkanoid (Taito)	-	-	mouse	4	-	plays on hardware (ROM 3); WOZ META says ROM1
+b8eecedb	2088: The Cryllan Mission (Disk 1)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+136997c0	2088: The Cryllan Mission (Disk 2)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+b17dc53c	2088: The Cryllan Mission (Disk 3)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+b09098ea	2088: The Cryllan Mission (Disk 1)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+b9a6ef69	2088: The Cryllan Mission (Disk 2)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+0666fe86	2088: The Cryllan Mission (Disk 3)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+80576d7a	2088: The Cryllan Mission (Disk 4)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+bf82f16a	4th & Inches (Disk 1)	-	-	-	-	-	requires_rom: Any
+82b74b2e	4th & Inches Team Construction Disk (Disk 1)	-	-	-	-	-	requires_rom: Any
+7d56e442	816-Paint IIgs	-	-	-	-	-	
+46787ccd	Aesop's Fables (Disk 1)	-	-	-	-	-	requires_rom: Any
+cfc45972	Aesop's Fables (Disk 2)	-	-	-	-	-	requires_rom: Any
+1a8b6332	Airball (Disk 1)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+2fe9d0a4	Alien Mind (Disk 1)	-	-	-	-	-	
+92bf8a4d	Alien Mind (Disk 2)	-	-	-	-	-	
+aa13487f	Ancient Glory (Disk 1)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+6f278f92	Ancient Glory (Y)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+668cf008	Arkanoid II (Disk 1)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+c744c99c	Cartooners (Disk 1)	-	-	-	-	-	requires_rom: Any
+01655d57	Cartooners (Disk 1)	-	-	-	-	-	requires_rom: Any
+18b9c15b	Cartooners (Disk 1)	-	-	-	-	-	requires_rom: Any
+9e4d7de3	Audubon Wildlife Adventures: Grizzly Bears (Disk 1)	-	-	-	-	-	requires_rom: Any
+0c36a391	Audubon Wildlife Adventures: Grizzly Bears (Disk 2)	-	-	-	-	-	requires_rom: Any
+ff46da39	Audubon Wildlife Adventures: Whales (Disk 1)	-	-	-	-	-	requires_rom: Any
+f5bebd98	Audubon Wildlife Adventures: Whales (Disk 2)	-	-	-	-	-	requires_rom: Any
+ff1497ea	Balance of Power (Disk 1)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+a0f797c6	Battle Chess (Disk 1)	-	-	-	-	-	
+9acfb716	BeagleDraw (Disk 1)	-	-	-	-	-	
+48ef6133	Beyond Zork (Disk 1)	rom01	-	-	-	-	requires_rom: IIgs ROM0+1
+eb9c0ab6	Blackjack Academy (Disk 1)	-	-	-	-	-	
+ad243a17	Block Out (Disk 1)	-	-	-	-	-	
+5f9dfcc7	Bridge 6.0 (Disk 1)	-	-	-	-	-	requires_rom: Any
+a1ce0e01	Bubble Ghost (Disk 1)	-	-	-	-	-	requires_rom: Any
+355bf6c9	Calendar Crafter (Disk 1)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+236858b6	California Games (Disk 1)	-	-	-	-	-	
+c85fa0ce	Captain Blood (Disk 1)	-	-	-	-	-	requires_rom: Any
+0faa4e71	Cartooners (Disk 1)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+6ebf343d	Cartooners (Disk 2)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+c4a2527c	Cavern Cobra (Disk 1)	-	-	-	-	-	
+10206a23	Charlie Brown's ABC's (Disk 1)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+cf00c80c	Charlie Brown's ABC's (Disk 1)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+447133d0	Club Backgammon (Disk 1)	-	-	-	-	-	requires_rom: Any
+4cbb6302	Columns GS (Disk 1)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+468bae15	Crystal Quest (Disk 1)	-	-	-	-	-	
+89dda1eb	Dark Castle (Disk 1)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+487b5ecc	Dark Castle (Disk 2)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+12c68349	Dark Castle (Disk 1)	-	-	-	-	-	requires_rom: Unknown
+ffb457c5	Dark Castle (Disk 2)	-	-	-	-	-	requires_rom: Unknown
+a9301dfd	Defender of the Crown (Disk 1)	-	-	-	-	-	requires_rom: Any
+9ddb5c80	Defender of the Crown (Disk 1)	-	-	-	-	-	requires_rom: Any
+c0e7a95a	Déjà Vu II (Disk 1)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+3c54f4f0	Déjà Vu (Disk 1)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+fdb018bb	Déjà Vu (Disk 1)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+8d76fc8b	DeluxePaint II (Disk 1)	-	-	-	-	-	requires_rom: Any
+3cf26f2c	DeluxePaint II (Disk 1)	-	-	-	-	-	requires_rom: Any
+c2914e28	Designer Prints (Disk 1)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+3518054d	Designer Prints (Disk 1)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+d4f3d66b	Designer Puzzles (Disk 1)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+cbf356de	Designer Puzzles (Disk 1)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+5936b99f	Destroyer (Disk 1)	-	-	-	-	-	requires_rom: Any
+0f7d459f	Downhill Challenge (Disk 1)	-	-	-	-	-	requires_rom: Any
+4cba5515	Downhill Challenge (Disk 1)	-	-	-	-	-	requires_rom: Any
+0acb0aae	Draw Plus (Disk 1)	-	-	-	-	-	requires_rom: Any
+b5e40a99	Draw Plus (Disk 1)	-	-	-	-	-	requires_rom: Any
+2e8d666a	Dream Zone (Disk 1)	-	-	-	-	-	requires_rom: Any
+7fe122d9	Dream Zone (Disk 2)	-	-	-	-	-	requires_rom: Any
+68b3870c	DreamGrafix (Disk 1)	-	-	-	-	-	
+37fd7366	Fantavision (Disk 1)	rom01	-	-	-	-	requires_rom: IIgs ROM0+1
+3bab4b52	Fast Break (Disk 1)	-	-	-	-	-	requires_rom: Any
+33412c6a	Final Assault (Disk 1)	-	-	-	-	-	
+8e09e840	First Categories (Disk 1)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+dfb3141e	First Letters and Words (Disk 1)	-	-	-	-	-	requires_rom: Any
+059d5060	First Shapes (Disk 1)	-	-	-	-	-	requires_rom: Any
+cb947475	Full Metal Planete (Disk 1)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+547c0fa1	GATE (Disk 1)	-	-	-	-	-	
+e69f4d24	GATE (Disk 2)	-	-	-	-	-	
+c54b0b04	GBA Championship Basketball (Disk 1)	-	-	-	-	-	requires_rom: Any
+93c31d63	GTV: A Geographic Perspective on American History (Disk 1)	-	-	-	-	-	requires_rom: Any
+6b55b7ad	GTV: A Geographic Perspective on American History (Disk 2)	-	-	-	-	-	requires_rom: Any
+7dcbf325	GTV: A Geographic Perspective on American History (Disk 3)	-	-	-	-	-	requires_rom: Any
+1b0118a9	Gauntlet (Disk 1)	-	-	-	-	-	
+f6cc034c	Geometry (Disk 1)	-	-	-	-	-	requires_rom: Any
+ea90303d	Geometry (Disk 1)	-	-	-	-	-	requires_rom: Any
+e891ac1b	Geometry (Disk 1)	-	-	-	-	-	requires_rom: Any
+87ee6a4b	Gin King / Cribbage King (Disk 1)	-	-	-	-	-	requires_rom: Any
+22cda4ec	Gin King / Cribbage King (Disk 2)	-	-	-	-	-	requires_rom: Any
+2cf64f57	Gnarly Golf (Disk 1)	-	-	-	-	-	requires_rom: Any
+0d28a455	Gnarly Golf (Disk 2)	-	-	-	-	-	requires_rom: Any
+ede2fd2c	Gold Rush! (Disk 1)	-	-	-	-	-	
+f40bd5e2	Gold Rush! (Disk 2)	-	-	-	-	-	
+30d69c23	Gold Rush! (Disk 3)	-	-	-	-	-	
+42d4d94e	Gold Rush! (Disk 4)	-	-	-	-	-	
+f561eff6	Grand Prix Circuit (Disk 1)	-	-	-	-	-	requires_rom: Unknown
+e6fd79c0	GraphicWriter III (Disk 1)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+9bb5cbc6	GraphicWriter III (Disk 1)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+ff48a53e	GraphicWriter III (Disk 1)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+19525a0e	Graphics Supermarket (Disk 1)	-	-	-	-	-	requires_rom: Any
+f57e049e	Great Western Shootout (Disk 1)	-	-	-	-	-	requires_rom: Any
+10c62cb0	Great Western Shootout (Disk 1)	-	-	-	-	-	requires_rom: Any
+f739b5f7	Hacker II: The Doomsday Papers (Disk 1)	-	-	-	-	-	requires_rom: Any
+95842218	Halls of Montezuma (Disk 1)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+0a443212	Halls of Montezuma (Disk 2)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+eb7b63af	Hardball! (Disk 1)	-	-	-	-	-	requires_rom: Unknown
+bafebaa6	Hover Blade (Disk 1)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+cdd4874c	Hover Blade (Disk 2)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+13f1bb0f	HyperStudio (Disk 1)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+134185d5	HyperStudio (Disk 1)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+c4aff736	HyperStudio (Disk 1)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+3674a262	HyperStudio (Disk 1)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+3a866bac	HyperStudio (Disk 1)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+2883696f	HyperStudio (Disk 1)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+f4024eb9	HyperStudio (Disk 1)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+890f81b1	ImageMaster: Basic Paint (Disk 1)	-	-	-	-	-	
+250edf0c	Impossible Mission II (Disk 1)	-	-	-	-	-	
+4e3632ed	Instant Synthesizer (Disk 1)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+552273aa	Instant Synthesizer (Disk 1)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+55fca08a	Jack Nicklaus' Greatest 18 Holes of Major Championship Golf (Disk 2)	-	-	-	-	-	requires_rom: Any
+588a20f7	Jack Nicklaus' Greatest 18 Holes of Major Championship Golf (Disk 1)	-	-	-	-	-	requires_rom: Any
+c56e2d8c	Jam Session (Disk 1)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+fafc6e8d	Jam Session (Disk 2)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+643fc712	Jigsaw (Disk 1)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+037e1dde	Jigsaw (Disk 1)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+27a7ffb6	John Elway's Quarterback (Disk 1)	-	-	-	-	-	requires_rom: Any
+03d356c5	Keef the Thief (Disk 1)	-	-	-	-	-	requires_rom: Unknown
+57ee8367	Keef the Thief (Disk 2)	-	-	-	-	-	requires_rom: Unknown
+bf58ddcb	King's Quest II (Disk 1)	-	-	-	-	-	requires_rom: Any
+718c0b23	King's Quest II (Disk 2)	-	-	-	-	-	requires_rom: Any
+7fe564a4	King's Quest III (Disk 1)	-	-	-	-	-	requires_rom: Any
+f926fcbc	King's Quest III (Disk 2)	-	-	-	-	-	requires_rom: Any
+ff9a94b8	King's Quest (Disk 1)	-	-	-	-	-	requires_rom: Any
+4d4408da	King's Quest (Disk 2)	-	-	-	-	-	requires_rom: Any
+864fd0eb	King's Quest IV (Disk 1)	-	-	-	-	-	requires_rom: Any
+4cf8a02b	King's Quest IV (Disk 2)	-	-	-	-	-	requires_rom: Any
+584104a4	King's Quest IV (Disk 3)	-	-	-	-	-	requires_rom: Any
+cfd614f0	LaserForce (Disk 1)	-	-	-	-	-	
+66d02cf1	LaserForce (Disk 1)	-	-	-	-	-	
+b30a5d8f	Leisure Suit Larry in the Land of the Lounge Lizards (Disk 1)	-	-	-	-	-	requires_rom: Any
+84a8a8a9	Leisure Suit Larry in the Land of the Lounge Lizards (Disk 2)	-	-	-	-	-	requires_rom: Any
+3ff9ed58	Life & Death (Disk 1)	-	-	-	-	-	
+3651eb99	Life & Death (Disk 2)	-	-	-	-	-	
+7c528829	List Plus (Disk 1)	-	-	-	-	-	requires_rom: Any
+40e5af0f	Mad Libs (Disk 1)	-	-	-	-	-	requires_rom: Any
+51bf6b80	Magical Myths (Disk 1)	-	-	-	-	-	requires_rom: Any
+eec9d33a	Magical Myths (Disk 1)	-	-	-	-	-	requires_rom: Any
+e93b38bb	Mancala (Disk 1)	-	-	-	-	-	requires_rom: Any
+eead95cd	Manhunter: New York (Disk 1)	-	-	-	-	-	requires_rom: Any
+9d9d122a	Manhunter: New York (Disk 2)	-	-	-	-	-	requires_rom: Any
+ec88f4d4	Manhunter: New York (Disk 3)	-	-	-	-	-	requires_rom: Any
+4a8b7061	Manhunter: New York (Disk 4)	-	-	-	-	-	requires_rom: Any
+4bfb689c	Marble Madness (Disk 1)	-	-	-	-	-	
+d65d3095	Master Tracks Jr (Disk 1)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+0a5241cd	Master Tracks Pro (Disk 1)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+60f4cf04	Math Blaster Plus! (Disk 1)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+116a70de	Math Wizard (Disk 1)	-	-	-	-	-	requires_rom: Any
+78e37387	Math Wizard (Disk 1)	-	-	-	-	-	requires_rom: Any
+327d3840	Math and Me (Disk 1)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+363768cf	Mavis Beacon Teaches Typing (Disk 1)	-	-	-	-	-	requires_rom: Any
+bc7f068b	Mavis Beacon Teaches Typing (Disk 2)	-	-	-	-	-	requires_rom: Any
+05fe38d2	Mazer II (Disk 1)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+04b2bb4f	Mean 18 (Disk 1)	-	-	-	-	-	requires_rom: Any
+f2702a02	Mean 18 (Disk 2)	-	-	-	-	-	requires_rom: Any
+f4ceec86	Mean 18 (Disk 3)	-	-	-	-	-	requires_rom: Any
+989b7116	Mean 18 (Disk 4)	-	-	-	-	-	requires_rom: Any
+ccf77921	Mercury (Disk 1)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+f4cbcfc7	Mercury (Disk 1)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+41acd5ea	Micol Advanced BASIC (Disk 1)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+786c0ddd	Micol Advanced BASIC (Disk 1)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+9ec89b34	Micol Advanced BASIC (Disk 1)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+4d99a449	Micol Advanced BASIC (Disk 1)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+8d215863	Micol Advanced BASIC (Disk 1)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+9903ee81	Mini-Putt (Disk 1)	-	-	-	-	-	requires_rom: Any
+36cd52dd	Mixed-Up Mother Goose (Disk 1)	-	-	-	-	-	requires_rom: Any
+f6d78dfe	Mixed-Up Mother Goose (Disk 2)	-	-	-	-	-	requires_rom: Any
+0e788501	Monte Carlo (Disk 1)	-	-	-	-	-	requires_rom: Any
+be502e77	MultiScribe GS	-	-	-	-	-	requires_rom: Any
+3f43fdd6	MultiScribe GS (Disk 1)	-	-	-	-	-	requires_rom: Any
+a80f62cb	Music Construction Set Dealer Demo Disk (Disk 1)	-	-	-	-	-	requires_rom: Any
+8e3fa169	Music Construction Set (Disk 1)	-	-	-	-	-	requires_rom: any
+354ea27f	Neuromancer (Disk 1)	-	-	-	-	-	requires_rom: Any
+e770a8ba	NoiseTracker (Disk 1)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+29612de7	Omega (Disk 1)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+3f0542d5	Out of this World (Disk 1)	-	-	-	-	-	requires_rom: Any
+3d59cebf	Out of this World (Disk 2)	-	-	-	-	-	requires_rom: Any
+9fec2a34	Paintworks Gold (Disk 2)	-	-	-	-	-	
+ee0a87d8	Paintworks Gold (Disk 1)	-	-	-	-	-	
+a26b15f1	Paintworks Plus (Disk 1)	-	-	-	-	-	
+a4434949	Panzer Battles (Disk 1)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+87d4166d	Panzer Battles (Disk 1)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+d4f26141	Paperboy (Disk 1)	rom01	-	-	-	-	requires_rom: IIgs ROM1
+5041d448	Peanuts Maze Marathon (Disk 1)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+9b383373	Peanuts Maze Marathon (Disk 1)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+cda35c87	Photonix II (Disk 1)	-	-	-	-	-	requires_rom: Any
+1d70bd65	Photonix (Disk 1)	rom01	-	-	-	-	requires_rom: IIgs ROM0+1
+a1235c80	Pipe Dream (Disk 1)	-	-	-	-	-	requires_rom: Any
+92275517	Platinum Paint Program Disk (Disk 1)	-	-	-	-	-	
+ec0c08db	Platinum Paint Program Disk (Disk 1)	-	-	-	-	-	
+5cd9eacd	Police Quest (Disk 1)	-	-	-	-	-	requires_rom: Any
+736c513b	Police Quest (Disk 2)	-	-	-	-	-	requires_rom: Any
+55415b10	Pyware (Disk 1)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+ccc081f2	Pyware Music Writer (Disk 1)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+27956940	Qix (Disk 1)	-	-	-	-	-	
+515455de	Questron II (Disk 1)	-	-	-	-	-	requires_rom: Any
+507d7a47	Rastan (Disk 1)	-	-	-	-	-	
+4680b089	Rastan (Disk 2)	-	-	-	-	-	
+a3176e3f	Reach for the Stars (Disk 1)	-	-	-	-	-	requires_rom: Any
+27c7e0ac	Read & Rhyme (Disk 1)	-	-	-	-	-	requires_rom: Any
+967db7bc	Read & Rhyme (Disk 2)	-	-	-	-	-	requires_rom: Any
+37c7cbd3	Read-A-Rama (Disk 1)	-	-	-	-	-	requires_rom: Any
+3659fe07	Read-A-Rama (Disk 1)	-	-	-	-	-	requires_rom: Any
+3b6ad3c8	Read-A-Rama - Level II (Disk 1)	-	-	-	-	-	requires_rom: Any
+4ec34a41	Reader Rabbit (Disk 1)	-	-	-	-	-	
+75af95da	Reading Magic Library: Jack and the Beanstalk (Disk 1)	-	-	-	-	-	requires_rom: Any
+9ed84411	Reading and Me (Disk 1)	-	-	-	-	-	
+515475d7	Reading and Me (Disk 1)	-	-	-	-	-	
+25c1cabc	Revolution '76 (Disk 1)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+4d950918	Revolution '76 (Disk 2)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+d3aa91fa	Revolution '76 (Disk 3)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+11683aad	Roadwar 2000 (Disk 1)	-	-	-	-	-	requires_rom: Any
+a3086eab	Rocket Ranger (Disk 1)	-	-	-	-	-	requires_rom: Any
+e8d96cc1	Rocket Ranger (Disk 1)	-	-	-	-	-	requires_rom: Any
+a754e640	Salvation Supreme (Disk 1)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+0f093360	Salvation Supreme (Disk 2)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+5edd031d	Sea Strike (Disk 1)	-	-	-	-	-	
+03337428	Serve & Volley (Disk 1)	-	-	-	-	-	
+7224ebd1	Shadowgate (Disk 1)	-	-	-	-	-	
+5e7402c2	Shadowgate (Disk 2)	-	-	-	-	-	
+52b1dcde	Shanghai II (Disk 1)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+392e6aa5	Shanghai II (Disk 2)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+1e0bedba	Shanghai (Disk 1)	-	-	-	-	-	requires_rom: Any
+6ad19486	ShowOff (Disk 1)	-	-	-	-	-	requires_rom: Any
+636e2003	ShowOff (Disk 2)	-	-	-	-	-	requires_rom: Any
+b1c9622c	ShowOff (Disk 3)	-	-	-	-	-	requires_rom: Any
+31b24e0b	Silent Service (Disk 1)	-	-	-	-	-	
+40751242	Silpheed (Disk 1)	-	-	-	-	-	requires_rom: Any
+49290982	Silpheed (Disk 2)	-	-	-	-	-	requires_rom: Any
+a48d084d	Sinbad and the Throne of the Falcon (Disk 1)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+f10cccc6	Sinbad and the Throne of the Falcon (Disk 2)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+7798a3bf	Skate or Die (Disk 1)	rom01	-	-	-	-	requires_rom: IIgs ROM1
+6c0e4263	Skate or Die (Disk 1)	rom01	-	-	-	-	requires_rom: IIgs ROM1
+dcd4bd36	Smooth Talker (Disk 1)	rom01	-	-	-	-	requires_rom: IIgs ROM0+1
+9a797f94	Snoopy's Reading Machine (Disk 1)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+7776d1ac	Solitaire & Cribbage (Disk 1)	-	-	-	-	-	requires_rom: Any
+bc6610ff	Solitaire Royale (Disk 1)	-	-	-	-	-	
+5f46e1bd	Space Ace (Disk 1)	-	-	-	-	-	requires_rom: Any
+2963ddad	Space Ace (Disk 2)	-	-	-	-	-	requires_rom: Any
+7b2aa5b2	Space Ace (Disk 3)	-	-	-	-	-	requires_rom: Any
+76d3aa35	Space Ace (Disk 4)	-	-	-	-	-	requires_rom: Any
+7c9b4119	Space Ace (Disk 5)	-	-	-	-	-	requires_rom: Any
+272318f8	Space Ace (Disk 6)	-	-	-	-	-	requires_rom: Any
+3097fc88	Space Ace (Disk 7)	-	-	-	-	-	requires_rom: Any
+cdac98f7	Space Ace (Disk 8)	-	-	-	-	-	requires_rom: Any
+db577b07	Space Ace (Disk 9)	-	-	-	-	-	requires_rom: Any
+76e7e31d	Space Fox (Disk 1)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+d9590e98	Space Fox (Disk 2)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+10f8db3c	Space Fox (Disk 3)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+5bc84546	Space Quest II (Disk 1)	-	-	-	-	-	requires_rom: Any
+766edbc8	Space Quest II (Disk 2)	-	-	-	-	-	requires_rom: Any
+6eccc30b	Space Quest (Disk 1)	-	-	-	-	-	requires_rom: Any
+ea9b33ea	Space Quest (Disk 2)	-	-	-	-	-	requires_rom: Any
+37735be8	Star Saga: One (Disk 1)	-	-	-	-	-	requires_rom: Any
+c651f2fc	Star Saga: Two (Disk 1)	-	-	-	-	-	requires_rom: Any
+e1544919	Stars & Planets (Disk 1)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+3ba2530b	Stickybear Shapes (Disk 1)	-	-	-	-	-	requires_rom: Any
+48cfaabc	Storybook Weaver - World of Adventure (Disk 1)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+cb65545c	Storybook Weaver - World of Adventure (Disk 1)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+1cfb8af1	Storybook Weaver: World of Make-Believe (Disk 1)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+e49d364c	Storybook Weaver: World of Make-Believe (Disk 1)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+4206de34	Storybook Weaver (Disk 1)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+665a586c	Storybook Weaver (Disk 1)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+e3a88e98	Street Sports Soccer (Disk 1)	rom01	-	-	-	-	requires_rom: IIgs ROM0+1
+a7cf8a7c	Strip Poker II (Disk 1)	-	-	-	-	-	requires_rom: Any
+a98b3db3	Sub Battle Simulator (Disk 1)	-	-	-	-	-	requires_rom: Any
+7f7f66b2	Superstar Ice Hockey (Disk 1)	-	-	-	-	-	requires_rom: Any
+d4090e46	Tales From The Arabian Nights (Disk 1)	-	-	-	-	-	requires_rom: Any
+96ca4b18	Tales From The Arabian Nights (Disk 2)	-	-	-	-	-	requires_rom: Any
+deccefcb	Tarot (Disk 2)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+a5b57521	Task Force (Disk 1)	-	-	-	-	-	
+5023a019	Task Force (Disk 2)	-	-	-	-	-	
+d62a7462	Tass Times in Tonetown (Disk 1)	-	-	-	-	-	
+b4f9385d	Tetris (Disk 1)	-	-	-	-	-	requires_rom: Any
+bfb7eb4e	The Bard's Tale (Disk 1)	-	-	-	-	-	requires_rom: Any
+591dba53	The Black Cauldron (Disk 1)	-	-	-	-	-	requires_rom: Any
+b68df94b	The Black Cauldron (Disk 2)	-	-	-	-	-	requires_rom: Any
+246414b9	The Duel: Test Drive II (Disk 3)	-	-	-	-	-	
+0b1a8551	The Duel: Test Drive II (Disk 1)	-	-	-	-	-	
+2bb38448	The Duel: Test Drive II (Disk 2)	-	-	-	-	-	
+b2b2fbde	The Duel: Test Drive II (Disk 1)	-	-	-	-	-	
+6837332c	The Fidelity Chessmaster 2100 (Disk 1)	-	-	-	-	-	requires_rom: Any
+c4762a57	The Fidelity Chessmaster 2100 (Disk 2)	-	-	-	-	-	requires_rom: Any
+0bea138e	The Fidelity Chessmaster 2100 (Disk 1)	-	-	-	-	-	requires_rom: Any
+c59fec4f	The Fidelity Chessmaster 2100 (Disk 2)	-	-	-	-	-	requires_rom: Any
+2eb09f84	The Graphics Studio (Disk 1)	-	-	-	-	-	requires_rom: Any
+8f340b1d	The Hunt for Red October (Disk 1)	-	-	-	-	-	
+889ce211	The Immortal (Disk 1)	-	-	-	-	-	requires_rom: Any
+e7094a78	The Immortal (Disk 2)	-	-	-	-	-	requires_rom: Any
+b6584b35	The King of Chicago (Disk 1)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+c0fab530	The King of Chicago (Disk 1)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+d525ef89	The Last Ninja (Disk 1)	-	-	-	-	-	
+0c6b6d15	The Logic Master (Disk 1)	-	-	-	-	-	requires_rom: Any
+dca541ab	The Logic Master (Disk 1)	-	-	-	-	-	requires_rom: Any
+15fb26d7	The Lost Tribe (Disk 1)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+a2cd43f6	The Lost Tribe (Disk 2)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+cd0a97be	The Lost Tribe (Disk 3)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+08e8d872	The Music Studio (Disk 1)	-	-	-	-	-	requires_rom: any
+d5b58ab4	The Music Studio (Disk 2)	-	-	-	-	-	requires_rom: any
+d3523378	The New Talking Stickybear Alphabet (Disk 1)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+00b00889	The New Talking Stickybear Alphabet (Disk 2)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+9730dd72	The New Talking Stickybear Opposites (Disk 1)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+2cb7a534	The Print Shop Companion IIgs (Disk 1)	-	-	-	-	-	requires_rom: Any
+2aad453a	The Print Shop IIgs (Disk 1)	rom01	-	-	-	-	requires_rom: IIgs ROM0+1
+c9a67560	The Third Courier (Disk 1)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+c8a3da1c	The Third Courier (Disk 2)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+f07969b5	The Three Stooges (Disk 1)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+4af6d21d	The Three Stooges (Disk 2)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+6abe4e8c	The Tower of Myraglen (Disk 1)	-	-	-	-	-	requires_rom: Any
+ea5700c2	The Tower of Myraglen (Disk 2)	-	-	-	-	-	requires_rom: Any
+bc181265	The Ugly Duckling (Disk 1)	-	-	-	-	-	requires_rom: Any
+0921d1db	The Ugly Duckling (Disk 2)	-	-	-	-	-	requires_rom: Any
+75edacce	The Wonders of the Animal Kingdom (Disk 1)	-	-	-	-	-	requires_rom: Any
+3e9125ef	The Wonders of the Animal Kingdom (Disk 2)	-	-	-	-	-	requires_rom: Any
+fd1dac06	The Word Master (Disk 1)	-	-	-	-	-	requires_rom: Any
+6faa6c12	Thexder (Disk 1)	-	-	-	-	-	requires_rom: Any
+df696daa	Tomahawk (Disk 1)	-	-	-	-	-	requires_rom: Any
+850680eb	TopDraw (Disk 1)	-	-	-	-	-	requires_rom: Any
+fc951f2d	Transylvania III (Disk 1)	-	-	-	-	-	requires_rom: Any
+d8c2e3d2	Transylvania III (Disk 2)	-	-	-	-	-	requires_rom: Any
+2e8193a0	TrianGo (Disk 1)	-	-	-	-	-	requires_rom: Any
+e48128b8	Tunnels of Armageddon (Disk 1)	-	-	-	-	-	requires_rom: Any
+f34ff567	Ultima I (Disk 1)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+d8c00f29	Uninvited (Disk 1)	-	-	-	-	-	
+c873a510	Uninvited (Disk 2)	-	-	-	-	-	
+6e74beba	Vegas Gambler (Disk 1)	-	-	-	-	-	requires_rom: Any
+2686946f	War in Middle Earth (Disk 1)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+1713d4b9	War in Middle Earth (Disk 2)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+b01f68df	Warlock (Disk 1)	-	-	-	-	-	requires_rom: Any
+06ef54b2	Warlock (Disk 1)	-	-	-	-	-	requires_rom: Any
+c68dc8d9	Where in the U.S.A. is Carmen Sandiego? (Disk 1)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+9ac97e09	Where in the U.S.A. is Carmen Sandiego? (Disk 2)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+3ebac7d9	Where in the World is Carmen Sandiego? (Disk 1)	-	-	-	-	-	requires_rom: Any
+a4253b96	Where in the World is Carmen Sandiego? (Disk 2)	-	-	-	-	-	requires_rom: Any
+0e38b43b	Where in the World is Carmen Sandiego? (Disk 1)	-	-	-	-	-	requires_rom: Any
+513b95cc	Where in the World is Carmen Sandiego? (Disk 2)	-	-	-	-	-	requires_rom: Any
+902e88df	Windwalker (Disk 1)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+1ae6aeab	Windwalker (Disk 2)	-	-	-	-	-	requires_rom: IIgs ROM1+3
+75d980a6	Winter Games (Disk 1)	-	-	-	-	-	requires_rom: Any
+a5bce03d	WordPerfect (Disk 1)	-	-	-	-	-	requires_rom: Any
+9bd69e34	WordPerfect (Disk 1)	-	-	-	-	-	requires_rom: Any
+85e2f46f	WordPerfect (Disk 1)	-	-	-	-	-	requires_rom: Any
+bf13512a	World Games (Disk 1)	-	-	-	-	-	
+eb2ade33	Writer's Choice Elite (Disk 1)	-	-	-	-	-	requires_rom: Any
+7b1f0176	Xenocide (Disk 1)	-	-	-	-	-	
+e866acd4	Zany Golf (Disk 1)	-	-	-	-	-	
+2ef1f9f5	Kernkompetenz	-	-	-	-	-	
+4bc4f4c3	nhf	-	-	-	-	-	
+ebbe8dee	qix iigs	-	-	-	-	-	

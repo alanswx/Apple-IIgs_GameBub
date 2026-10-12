@@ -330,6 +330,17 @@ Built as section 6 describes, with these choices:
   units per 1/100 s): the default 1 then 6 after 0.4 s suits the desktop,
   but on hardware Arkanoid's paddle wanted a steady 4. "D-pad Mouse Speed"
   in the menu overrides it (Auto = the game list).
+* ROM "Auto" prefers ROM 01 when the card has it: of the 353 IIgs 3.5"
+  WOZ images in the woz-a-day set none needs ROM 3, ten say ROM 1 only.
+  `mkgamedb.py --seed DIR` appends every unlisted 3.5" disk with its META
+  title and ROM 01 where `requires_rom` rules ROM 3 out (356 games).
+* CPU Speed cannot shorten loading: `iigs.sv` runs the accelerator at
+  native speed whenever a drive motor is on (as a real ZipGS slows for
+  disk access), so only the work between reads speeds up. Faster loads
+  would need the drive and CPU sped up together ("fast disk").
+* "Disk Light" (`gb_disk_light.sv`): the framework gives cores no LED, so
+  a small red lamp is drawn in the frame's top-right corner while the 3.5"
+  motor runs.
 * Not done yet: joystick-only mode, settings actions for extra keys.
 
 ### Sound level (2026-10-12)
