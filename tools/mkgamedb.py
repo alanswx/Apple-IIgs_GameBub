@@ -17,7 +17,9 @@ SDRAM burst):
               u8  rom    0 auto, 1 ROM 3, 2 ROM 01
               u8  speed  0..4 (2.8, 3.6, 4.8, 7.2, 14.3 MHz), 0xFF no preference
               u8  input  0 keyboard mode, 1 mouse mode, 0xFF no preference
-              u8  0
+              u8  mouse  pointer speed in mouse units per d-pad report (100 Hz):
+                         [3:0] for the first 0.4 s a direction is held,
+                         [7:4] after; 0 = the core's default (1, then 6)
               u64 button map: 9-bit PS/2 set 2 scancodes (bit 8 = E0
                   prefix, 0 = button does nothing), A [8:0], B [17:9],
                   X [26:18], Y [35:27], L [44:36], R [53:45], Start [62:54],
@@ -93,6 +95,21 @@ def parse_map(text, where):
     return word | (1 << 63)
 
 
+def parse_mouse(text, where):
+    """'-' default, 'N' steady N, 'S-F' S for 0.4 s then F (1..15)."""
+    t = text.strip() or '-'
+    if t == '-':
+        return 0
+    try:
+        slow, _, fast = t.partition('-')
+        slow, fast = int(slow), int(fast or slow)
+    except ValueError:
+        raise ValueError(f'{where}: bad mouse {text!r} (-, N or S-F)')
+    if not (1 <= slow <= 15 and 1 <= fast <= 15):
+        raise ValueError(f'{where}: mouse steps must be 1..15: {text!r}')
+    return fast << 4 | slow
+
+
 def lookup(table, value, what, where):
     v = value.strip().lower() or '-'
     if v not in table:
@@ -130,7 +147,7 @@ def build(rows):
                                 lookup(ROMS, r['rom'], 'rom', where),
                                 lookup(SPEEDS, r['speed'], 'speed', where),
                                 lookup(INPUTS, r['input'], 'input', where),
-                                0,
+                                parse_mouse(r.get('mouse', '-'), where),
                                 parse_map(r['buttons'], where)))
     out = b'GSDB' + struct.pack('<BBH', VERSION, 0, len(recs)) + bytes(8) + b''.join(recs)
     if len(out) > MAX_BYTES:

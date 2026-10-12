@@ -4,10 +4,12 @@
 #   rom      auto | rom3 | rom01
 #   speed    - | 2.8 | 3.6 | 4.8 | 7.2 | 14.3   (MHz; "-" leaves the menu setting)
 #   input    - | mouse | keyboard              (mode at start; Select toggles)
+#   mouse    - | N | S-F   d-pad pointer speed, mouse units per 1/100 s:
+#            N steady, or S for the first 0.4 s of a hold then F (1..15).
+#            "-" = 1-6, the core's default (good for desktops).
 #   buttons  button=key;...  buttons a b x y l r start; keys as in mkgamedb.py
 #            KEYS (return, space, esc, up, oa, option, a..z, 0..9, none, ...).
 #            Unlisted buttons keep the defaults: a=return b=space x=esc y=y
 #            l=oa r=option start=return. In mouse mode A is the mouse button.
-crc32	title	rom	speed	input	buttons	notes
-ea115ce2	Arkanoid (Taito)	rom3	-	mouse	-	sim: reaches the Taito intro
-83e95893	Lemmings	rom3	-	mouse	-	
+crc32	title	rom	speed	input	mouse	buttons	notes
+ea115ce2	Arkanoid (Taito)	rom3	-	mouse	4	-	plays on hardware (ROM 3); WOZ META says ROM1

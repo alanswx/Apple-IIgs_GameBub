@@ -23,6 +23,9 @@
 //   +gamedb=<file>  game database (tools/mkgamedb.py; file 4)
 //   +speed=<n>      CPU speed setting 0..4, 15 = auto (the default)
 //   +kbd_mode       start the pad in keyboard mode (default: auto)
+//   +mouse=<hex>    d-pad pointer steps setting {fast, slow}, 0 = auto
+//   +trace_mouse    print each pointer report the pad sends
+//   +volume=<n>     Music Volume setting: DOC x(1 << n), 2..5 (default 4)
 //   +frames=<n>     stop after n frames (default 300)
 //   +dump=<k>       write every k-th frame (default 25)
 //   +raw            also dump the VGC's raw output (whole line, border included)
@@ -30,9 +33,12 @@
 //   +paced          stream files at the real MCU's fixed SPI rate through a
 //                   model of the framework's FIFOs (see "Paced host model")
 //   +press=<f>:<b>  hold button b (a b x y l r up down left right start
-//                   select) from frame f for 6 frames; repeatable up to 8x
-//                   as +press=..., +press2=..., ... +press8=...
+//                   select) from frame f for 6 frames (+press=<f>:<b>:<n>
+//                   for n frames); repeatable up to 8x as +press=...,
+//                   +press2=..., ... +press8=...
 //   +stop_after_load   end after the files are loaded
+//   +io_stats       count reads of the input registers (keyboard, mouse,
+//                   buttons, paddles) per 100 frames
 // ============================================================================
 `timescale 1ps/1ps
 `default_nettype none
@@ -653,6 +659,33 @@ module tb_gamebub #(
 	end
 
 	// -------------------------------------------------------------------
+	// Input register reads (+io_stats): which of keyboard, mouse,
+	// buttons and paddles the running program polls, per 100 frames.
+	integer io_rd [0:255];
+	integer io_frame = -1;
+	initial for (int i = 0; i < 256; i++) io_rd[i] = 0;
+	always @(posedge clk_sys) if ($test$plusargs("io_stats")) begin
+		if (dut.core.iigs.phi2 && dut.core.iigs.IO && !dut.core.iigs.we)
+			io_rd[dut.core.iigs.addr_bef[7:0]] <= io_rd[dut.core.iigs.addr_bef[7:0]] + 1;
+		if (frame % 100 == 0 && frame != io_frame) begin
+			io_frame <= frame;
+			$display("TB IO: frame %0d kbd C000=%0d C010=%0d C025=%0d | mouse C024=%0d C027=%0d C044=%0d C045=%0d | btn C061=%0d C062=%0d C063=%0d | paddle C064=%0d C065=%0d C070=%0d | vbl C019=%0d C02E=%0d",
+			         frame, io_rd[8'h00], io_rd[8'h10], io_rd[8'h25], io_rd[8'h24], io_rd[8'h27], io_rd[8'h44], io_rd[8'h45],
+			         io_rd[8'h61], io_rd[8'h62], io_rd[8'h63], io_rd[8'h64], io_rd[8'h65], io_rd[8'h70], io_rd[8'h19], io_rd[8'h2E]);
+			for (int i = 0; i < 256; i++) io_rd[i] <= 0;
+		end
+	end
+
+	// +trace_mouse: the pad's pointer reports (gb_pad_input -> adb.sv)
+	reg mouse_tog = 1'b0;
+	always @(posedge clk_sys) begin
+		mouse_tog <= dut.ps2_mouse[24];
+		if ($test$plusargs("trace_mouse") && dut.ps2_mouse[24] != mouse_tog)
+			$display("TB MOUSE: frame %0d dx=%0d dy=%0d btn=%0d", frame,
+			         $signed({dut.ps2_mouse[4], dut.ps2_mouse[15:8]}),
+			         $signed({dut.ps2_mouse[5], dut.ps2_mouse[23:16]}), dut.ps2_mouse[0]);
+	end
+
 	// Button presses (+press=<frame>:<button>)
 	// -------------------------------------------------------------------
 	function automatic integer btn_index(input string s);
@@ -666,6 +699,7 @@ module tb_gamebub #(
 
 	integer press_frame [0:7];
 	integer press_btn   [0:7];
+	integer press_len   [0:7];
 	integer npress = 0;
 	initial begin : parse_presses
 		string s, b, key;
@@ -676,10 +710,16 @@ module tb_gamebub #(
 				f = 0;
 				for (i = 0; i < s.len() && s[i] != ":"; i = i + 1) f = f * 10 + (s[i] - "0");
 				b = s.substr(i + 1, s.len() - 1);
+				press_len[npress] = 6;
+				for (i = 0; i < b.len() && b[i] != ":"; i = i + 1) ;
+				if (i < b.len()) begin
+					press_len[npress] = b.substr(i + 1, b.len() - 1).atoi();
+					b = b.substr(0, i - 1);
+				end
 				press_frame[npress] = f;
 				press_btn[npress]   = btn_index(b);
 				if (press_btn[npress] < 0) $display("TB: unknown button '%s'", b);
-				else $display("TB: will press %s at frame %0d", b, f);
+				else $display("TB: will press %s at frame %0d for %0d frames", b, f, press_len[npress]);
 				npress = npress + 1;
 			end
 		end
@@ -689,7 +729,7 @@ module tb_gamebub #(
 		reg [11:0] want;
 		want = 12'd0;
 		for (k = 0; k < npress; k = k + 1)
-			if (press_btn[k] >= 0 && frame >= press_frame[k] && frame < press_frame[k] + 6)
+			if (press_btn[k] >= 0 && frame >= press_frame[k] && frame < press_frame[k] + press_len[k])
 				want[press_btn[k]] = 1'b1;
 		btn <= want;
 	end
@@ -731,6 +771,8 @@ module tb_gamebub #(
 		// Settings, written during setup like the MCU does (settings.json)
 		if ($value$plusargs("speed=%d", speed)) mem_write(32'h0000_0204, speed);
 		if ($test$plusargs("kbd_mode"))         mem_write(32'h0000_0208, 32'd0);
+		if ($value$plusargs("mouse=%h", speed)) mem_write(32'h0000_020C, speed);
+		if ($value$plusargs("volume=%d", speed)) mem_write(32'h0000_0210, speed);
 
 		if (rom3_path != "")  load_file(2, rom3_path,  32'h10FC_0000, len);
 		if (rom01_path != "") load_file(3, rom01_path, 32'h10F8_0000, len);
@@ -757,9 +799,9 @@ module tb_gamebub #(
 		$display("TB: GetStatus = %0d (expect 3 = halted) after %0d polls, %0d us after SetupComplete (firmware limit 100000)",
 		         r, polls, ($time - t_setup) / 1_000_000);
 		if (r != 3) $display("TB ERROR: core never reported halted");
-		$display("TB: gamedb found=%0d crc=%08h rom=%0d speed=%0d input=%0d keymap=%016h -> rom_select=%0d host_speed=%0d ptr_default=%0d",
-		         dut.db_found, dut.db_crc, dut.db_rom, dut.db_speed, dut.db_input, dut.db_keymap,
-		         dut.rom_select, dut.host_speed, dut.ptr_default);
+		$display("TB: gamedb found=%0d crc=%08h rom=%0d speed=%0d input=%0d mouse=%02h keymap=%016h -> rom_select=%0d host_speed=%0d ptr_default=%0d mouse_steps=%02h",
+		         dut.db_found, dut.db_crc, dut.db_rom, dut.db_speed, dut.db_input, dut.db_mouse, dut.db_keymap,
+		         dut.rom_select, dut.host_speed, dut.ptr_default, dut.mouse_steps);
 		host_cmd(16'h0200, 1, 0, 0, r);           // NotifyFocus(1)
 		host_cmd(16'h0100, 0, 0, 0, r);           // CoreRun
 		host_cmd(16'h0000, 0, 0, 0, r);

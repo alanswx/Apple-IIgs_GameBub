@@ -36,6 +36,7 @@ module iigs_core (
 	// ---- input ----
 	input  wire [10:0] ps2_key,
 	input  wire [24:0] ps2_mouse,
+	input  wire [2:0]  doc_gain,         // sound.sv DOC level x(1 << doc_gain)
 	input  wire [31:0] joystick_0,       // [4] button 0, [5] button 1
 	input  wire [15:0] joystick_l_analog_0, // [7:0] X, [15:8] Y, signed
 
@@ -241,6 +242,7 @@ module iigs_core (
 		.zip_regs_en(zip_regs_en),
 		.twgs_present(twgs_present),
 		.osd_spkr_delay(1'b1),
+		.DOC_GAIN(doc_gain),
 		.osd_pdl_delay(1'b1),
 		.osd_ctr_delay(1'b1),
 		.osd_cps_follow(1'b0),

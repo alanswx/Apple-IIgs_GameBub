@@ -111,7 +111,8 @@ module iigs_gamebub (
 	wire [31:0] dbg_blockdev, dbg_host_state, dbg_woz_magic;
 	wire        db_start, db_done, db_found;
 	wire  [1:0] db_rom;
-	wire  [7:0] db_speed, db_input;
+	wire  [7:0] db_speed, db_input, db_mouse, mouse_steps;
+	wire  [2:0] doc_gain;
 	wire [31:0] db_crc;
 	wire [62:0] db_keymap;
 
@@ -151,6 +152,9 @@ module iigs_gamebub (
 		.db_rom         (db_rom),
 		.db_speed       (db_speed),
 		.db_input       (db_input),
+		.db_mouse       (db_mouse),
+		.mouse_steps    (mouse_steps),
+		.doc_gain       (doc_gain),
 		.file_present   (file_present),
 		.file_size_flat (file_size_flat),
 		.dbg_blockdev   (dbg_blockdev),
@@ -244,6 +248,7 @@ module iigs_gamebub (
 		.rom          (db_rom),
 		.speed        (db_speed),
 		.input_mode   (db_input),
+		.mouse        (db_mouse),
 		.keymap       (db_keymap)
 	);
 
@@ -334,6 +339,8 @@ module iigs_gamebub (
 		.ps2_key     (ps2_key),
 		.ps2_mouse   (ps2_mouse),
 		.ptr_default (ptr_default),
+		.step_slow   (mouse_steps[3:0]),
+		.step_fast   (mouse_steps[7:4]),
 		.ptr_mode    ()
 	);
 
@@ -373,6 +380,7 @@ module iigs_gamebub (
 		.host_speed          (host_speed),
 		.ps2_key             (ps2_key),
 		.ps2_mouse           (ps2_mouse),
+		.doc_gain            (doc_gain),
 		.joystick_0          (32'd0),
 		.joystick_l_analog_0 ({joy_y, joy_x}),
 		.sd_lba              (sd_lba),

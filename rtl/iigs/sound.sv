@@ -15,7 +15,8 @@ module sound
     output [3:0]      ca,
     output            irq,
     // Apple II speaker input
-    input             speaker_state);
+    input             speaker_state,
+    input [2:0]       doc_gain);   // [gamebub] DOC level x(1 << doc_gain); upstream 2
 
    wire [16:0]       doc_addr_out;
    wire [15:0]       ram_addr;
@@ -37,14 +38,18 @@ module sound
    assign glu_data_in = ram_select ? ram_data_out : doc_data_out;
    assign ram_addr    = osc_en ? doc_addr_out[15:0] : glu_addr_out;
 
-   wire signed [15:0] iir_boosted_l = iir_sound_out_l <<< 2;
-   wire signed [15:0] iir_boosted_r = iir_sound_out_r <<< 2;
+   // [gamebub] saturating x(1 << doc_gain)
+   function automatic signed [15:0] sat16(input signed [23:0] v);
+      sat16 = (v > 24'sd32767) ? 16'sh7FFF : (v < -24'sd32768) ? 16'sh8000 : v[15:0];
+   endfunction
+   wire signed [15:0] iir_boosted_l = sat16($signed({{8{iir_sound_out_l[15]}}, iir_sound_out_l}) <<< doc_gain);
+   wire signed [15:0] iir_boosted_r = sat16($signed({{8{iir_sound_out_r[15]}}, iir_sound_out_r}) <<< doc_gain);
 
    // TODO: Better speaker click modeling; for now just toggle a bit like the IIe core
    wire signed [15:0] speaker_audio = speaker_state ? 16'sh0800 : -16'h0800;
 
-   assign sound_out_l = iir_boosted_l + speaker_audio;
-   assign sound_out_r = iir_boosted_r + speaker_audio;
+   assign sound_out_l = sat16(iir_boosted_l + speaker_audio);   // [gamebub] saturate
+   assign sound_out_r = sat16(iir_boosted_r + speaker_audio);
 
    reg [15:0] doc_sound_l;
    reg [15:0] doc_sound_r;

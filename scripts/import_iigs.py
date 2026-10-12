@@ -198,7 +198,8 @@ def patch_iigs(text, src):
         "        .wren_a(slowram_we),\n"
         "        .enable_a(slowram_ce),\n"
     )
-    return replace_once(text, old, new, "iigs.sv slowram")
+    text = replace_once(text, old, new, "iigs.sv slowram")
+    return patch_iigs_doc_gain(text)
 
 
 def patch_vgc(text, src):
@@ -248,6 +249,51 @@ def patch_es5503(text, src):
     wire; Quartus and Verilator accept that, Vivado rejects it (Synth 8-2577)."""
     return replace_once(text, "    output [3:0]      ca,\n",
                         "    output reg [3:0]  ca,   // [gamebub] reg for Vivado\n", "es5503.v ca")
+
+
+def patch_iigs_doc_gain(text):
+    """A DOC_GAIN input (iigs_core, the "Music Volume" setting) for sound.v."""
+    text = replace_once(text,
+        "   input              osd_spkr_delay,  // $C05C bit 0 (speaker)\n",
+        "   input              osd_spkr_delay,  // $C05C bit 0 (speaker)\n"
+        "   input        [2:0] DOC_GAIN,        // [gamebub] sound.v DOC gain, 2 = upstream\n",
+        "iigs.sv DOC_GAIN port")
+    return replace_once(text,
+        "            .speaker_state(speaker_state)\n            );\n",
+        "            .speaker_state(speaker_state),\n"
+        "            .doc_gain(DOC_GAIN)    // [gamebub]\n            );\n",
+        "iigs.sv sound doc_gain")
+
+
+def patch_sound(text, src):
+    """The DOC's filtered output is an average over all 32 oscillator slots,
+    so music plays far below full scale; upstream lifts it by a fixed x4 that
+    wraps on overflow. Make the shift a port (1 << doc_gain) and saturate,
+    here and where the speaker is added."""
+    text = replace_once(text,
+        "    input             speaker_state);\n",
+        "    input             speaker_state,\n"
+        "    input [2:0]       doc_gain);   // [gamebub] DOC level x(1 << doc_gain); upstream 2\n",
+        "sound.v doc_gain port")
+    old = (
+        "   wire signed [15:0] iir_boosted_l = iir_sound_out_l <<< 2;\n"
+        "   wire signed [15:0] iir_boosted_r = iir_sound_out_r <<< 2;\n"
+    )
+    new = (
+        "   // [gamebub] saturating x(1 << doc_gain)\n"
+        "   function automatic signed [15:0] sat16(input signed [23:0] v);\n"
+        "      sat16 = (v > 24'sd32767) ? 16'sh7FFF : (v < -24'sd32768) ? 16'sh8000 : v[15:0];\n"
+        "   endfunction\n"
+        "   wire signed [15:0] iir_boosted_l = sat16($signed({{8{iir_sound_out_l[15]}}, iir_sound_out_l}) <<< doc_gain);\n"
+        "   wire signed [15:0] iir_boosted_r = sat16($signed({{8{iir_sound_out_r[15]}}, iir_sound_out_r}) <<< doc_gain);\n"
+    )
+    text = replace_once(text, old, new, "sound.v boost")
+    return replace_once(text,
+        "   assign sound_out_l = iir_boosted_l + speaker_audio;\n"
+        "   assign sound_out_r = iir_boosted_r + speaker_audio;\n",
+        "   assign sound_out_l = sat16(iir_boosted_l + speaker_audio);   // [gamebub] saturate\n"
+        "   assign sound_out_r = sat16(iir_boosted_r + speaker_audio);\n",
+        "sound.v mix")
 
 
 def patch_sdram_ch2_read(text):
@@ -361,6 +407,7 @@ PATCHES = {
     "rtl/adb.v": patch_adb,
     "rtl/prtc.v": patch_prtc,
     "rtl/es5503.v": patch_es5503,
+    "rtl/sound.v": patch_sound,
     "rtl/uart/rxuart.v": patch_default_nettype,
     "rtl/uart/txuart.v": patch_default_nettype,
     "rtl/sdram_burst.sv": patch_sdram_burst,

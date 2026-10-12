@@ -326,8 +326,22 @@ Built as section 6 describes, with these choices:
   joystick and Select toggles mouse and keyboard mode, as before.
 * Unknown disk: the defaults, and its CRC is word 3 of the PMOD beacon
   (word 6 bit 5 = found, bit 4 = lookup done).
-* Not done yet: per-game mouse speed, joystick-only mode, settings actions
-  for extra keys.
+* Pointer speed (`mouse` column; record byte 7 = {fast, slow} step, mouse
+  units per 1/100 s): the default 1 then 6 after 0.4 s suits the desktop,
+  but on hardware Arkanoid's paddle wanted a steady 4. "D-pad Mouse Speed"
+  in the menu overrides it (Auto = the game list).
+* Not done yet: joystick-only mode, settings actions for extra keys.
+
+### Sound level (2026-10-12)
+
+On hardware the music was far too quiet. `sound.v` low-pass filters the
+DOC's time-multiplexed output, so each voice is averaged over all 32
+oscillator slots and a few voices of music land near 1/30 of full scale;
+upstream lifts that by a fixed x4 (which wraps on overflow) and adds the
+speaker at a constant +-2048. Import patches give `sound.v` a `doc_gain`
+input (DOC x(1 << doc_gain), saturating, also where the speaker is added)
+and `iigs.sv` a `DOC_GAIN` port; the "Music Volume" setting picks x4
+(upstream), x8, x16 (default) or x32.
 
 ## 10. Open questions
 

@@ -95,6 +95,13 @@ module gb_pad_input #(
 	// only safe sampling point.
 	input  wire        ptr_default,
 
+	// Pointer speed in mouse units per report, from the settings / game
+	// database (iigs_gamebub.sv): the step for the first PTR_RAMP_MS of a
+	// held direction, then the step after it. Equal = no acceleration.
+	// 0 = the PTR_STEP_SLOW / PTR_STEP_FAST parameter.
+	input  wire [3:0]  step_slow,
+	input  wire [3:0]  step_fast,
+
 	// 1 = pointer mode, 0 = keyboard mode. Exposed for debug/LED only.
 	output wire        ptr_mode
 );
@@ -337,8 +344,9 @@ module gb_pad_input #(
 	reg [15:0] hold_ticks;             // how long a direction has been held
 	reg        btn_reported;
 
-	wire [7:0] step = (hold_ticks >= RAMP_TICKS[15:0]) ? PTR_STEP_FAST[7:0]
-	                                                   : PTR_STEP_SLOW[7:0];
+	wire [7:0] slow = (step_slow != 4'd0) ? {4'd0, step_slow} : PTR_STEP_SLOW[7:0];
+	wire [7:0] fast = (step_fast != 4'd0) ? {4'd0, step_fast} : PTR_STEP_FAST[7:0];
+	wire [7:0] step = (hold_ticks >= RAMP_TICKS[15:0]) ? fast : slow;
 
 	// Deltas as 9-bit TWO'S COMPLEMENT.
 	//

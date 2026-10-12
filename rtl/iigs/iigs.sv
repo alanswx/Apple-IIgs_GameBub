@@ -118,6 +118,7 @@ module iigs
    // TWGS card selected the windows are forced on (a real TransWarp's
    // slowdowns are automatic and non-configurable).
    input              osd_spkr_delay,  // $C05C bit 0 (speaker)
+   input        [2:0] DOC_GAIN,        // [gamebub] sound.v DOC gain, 2 = upstream
    input              osd_pdl_delay,   // $C059 bit 6 (joystick/paddle)
    input              osd_ctr_delay,   // $C059 bit 4 (video counter)
    input              osd_cps_follow,  // $C059 bit 3 (CPS follow)
@@ -2500,7 +2501,8 @@ wire ready_out;
             .sound_out_l(AUDIO_L),
             .sound_out_r(AUDIO_R),
             .irq(snd_irq),
-            .speaker_state(speaker_state)
+            .speaker_state(speaker_state),
+            .doc_gain(DOC_GAIN)    // [gamebub]
             );
 
   // =========================================================================

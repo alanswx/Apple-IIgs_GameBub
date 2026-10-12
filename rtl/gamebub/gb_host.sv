@@ -79,6 +79,9 @@ module gb_host (
 	input  wire  [1:0] db_rom,           // 0 auto, 1 ROM 3, 2 ROM 01
 	input  wire  [7:0] db_speed,         // 0..4, 0xFF no preference
 	input  wire  [7:0] db_input,         // 0 keyboard, 1 mouse, 0xFF no preference
+	input  wire  [7:0] db_mouse,         // pointer steps {fast, slow}, 0 no preference
+	output wire  [7:0] mouse_steps,      // pointer steps {fast, slow}, 0 = default
+	output wire  [2:0] doc_gain,         // music volume: DOC x(1 << doc_gain)
 
 	// ---- file table ----
 	output reg   [4:0] file_present,
@@ -127,10 +130,14 @@ module gb_host (
 	localparam [11:0] SET_ROM         = 12'h200;  // 0 = auto, 1 = ROM 3, 2 = ROM 01
 	localparam [11:0] SET_SPEED       = 12'h204;  // host_speed 0..4, 0xF = auto
 	localparam [11:0] SET_PTR_DEFAULT = 12'h208;  // 0 keyboard, 1 mouse, 2 = auto
+	localparam [11:0] SET_MOUSE       = 12'h20C;  // pointer steps {fast, slow}, 0 = auto
+	localparam [11:0] SET_VOLUME      = 12'h210;  // DOC gain shift 2..5 (2 = upstream)
 
 	reg  [31:0] set_rom         = 32'd0;
 	reg  [31:0] set_speed       = 32'hF;
 	reg  [31:0] set_ptr_default = 32'd2;
+	reg  [31:0] set_mouse       = 32'd0;
+	reg  [31:0] set_volume      = 32'd4;
 
 	// "Auto" settings take the game database's choice for this disk
 	// (gb_gamedb), else: ROM 3 if the card has it, else ROM 01; normal
@@ -146,6 +153,8 @@ module gb_host (
 	assign ptr_default = (set_ptr_default[1:0] == 2'd2) ?
 	                         ((db_found && db_input <= 8'd1) ? db_input[0] : 1'b1) :
 	                     set_ptr_default[0];
+	assign doc_gain    = (set_volume[2:0] < 3'd2) ? 3'd2 : (set_volume[2:0] > 3'd5) ? 3'd5 : set_volume[2:0];
+	assign mouse_steps = (set_mouse[7:0] == 8'd0) ? (db_found ? db_mouse : 8'd0) : set_mouse[7:0];
 
 	// ---------------------------------------------------------------------
 	// Core state
@@ -215,6 +224,8 @@ module gb_host (
 			SET_ROM:          local_read = set_rom;
 			SET_SPEED:        local_read = set_speed;
 			SET_PTR_DEFAULT:  local_read = set_ptr_default;
+			SET_MOUSE:        local_read = set_mouse;
+			SET_VOLUME:       local_read = set_volume;
 			12'h800:          local_read = 32'h49494753;   // "IIGS"
 			12'h804:          local_read = dbg_state;
 			12'h808:          local_read = woz_magic;
@@ -292,6 +303,8 @@ module gb_host (
 							SET_ROM:         set_rom         <= mem_dataWrite;
 							SET_SPEED:       set_speed       <= mem_dataWrite;
 							SET_PTR_DEFAULT: set_ptr_default <= mem_dataWrite;
+							SET_MOUSE:       set_mouse       <= mem_dataWrite;
+							SET_VOLUME:      set_volume      <= mem_dataWrite;
 							default: ;
 						endcase
 					end else begin

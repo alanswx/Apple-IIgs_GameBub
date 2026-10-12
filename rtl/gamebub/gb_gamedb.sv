@@ -37,6 +37,7 @@ module gb_gamedb (
 	output reg  [1:0]  rom,            // 0 auto, 1 ROM 3, 2 ROM 01
 	output reg  [7:0]  speed,          // 0..4, 0xFF no preference
 	output reg  [7:0]  input_mode,     // 0 keyboard, 1 mouse, 0xFF no preference
+	output reg  [7:0]  mouse,          // pointer steps {fast, slow}, 0 no preference
 	output reg  [62:0] keymap          // 7 x 9-bit scancodes: start r l y x b a
 );
 
@@ -105,6 +106,7 @@ module gb_gamedb (
 					rom        <= mem_line[33:32];
 					speed      <= mem_line[47:40];
 					input_mode <= mem_line[55:48];
+					mouse      <= mem_line[63:56];
 					keymap     <= mem_line[126:64];
 					next       <= S_DONE;
 				end else begin

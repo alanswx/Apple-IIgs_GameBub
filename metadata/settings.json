@@ -21,9 +21,18 @@
 			"type": "list",
 			"default": "0x0",
 			"items": [
-				{"label": "Auto (game list)", "value": "0x0"},
-				{"label": "ROM 3", "value": "0x1"},
-				{"label": "ROM 01", "value": "0x2"}
+				{
+					"label": "Auto (game list)",
+					"value": "0x0"
+				},
+				{
+					"label": "ROM 3",
+					"value": "0x1"
+				},
+				{
+					"label": "ROM 01",
+					"value": "0x2"
+				}
 			]
 		},
 		{
@@ -33,12 +42,30 @@
 			"type": "list",
 			"default": "0xF",
 			"items": [
-				{"label": "Auto (game list)", "value": "0xF"},
-				{"label": "2.8 MHz (normal)", "value": "0x0"},
-				{"label": "3.6 MHz", "value": "0x1"},
-				{"label": "4.8 MHz", "value": "0x2"},
-				{"label": "7.2 MHz", "value": "0x3"},
-				{"label": "14.3 MHz", "value": "0x4"}
+				{
+					"label": "Auto (game list)",
+					"value": "0xF"
+				},
+				{
+					"label": "2.8 MHz (normal)",
+					"value": "0x0"
+				},
+				{
+					"label": "3.6 MHz",
+					"value": "0x1"
+				},
+				{
+					"label": "4.8 MHz",
+					"value": "0x2"
+				},
+				{
+					"label": "7.2 MHz",
+					"value": "0x3"
+				},
+				{
+					"label": "14.3 MHz",
+					"value": "0x4"
+				}
 			]
 		},
 		{
@@ -48,9 +75,76 @@
 			"type": "list",
 			"default": "0x2",
 			"items": [
-				{"label": "Auto (game list)", "value": "0x2"},
-				{"label": "Mouse Mode", "value": "0x1"},
-				{"label": "Keyboard Mode", "value": "0x0"}
+				{
+					"label": "Auto (game list)",
+					"value": "0x2"
+				},
+				{
+					"label": "Mouse Mode",
+					"value": "0x1"
+				},
+				{
+					"label": "Keyboard Mode",
+					"value": "0x0"
+				}
+			]
+		},
+		{
+			"id": 5,
+			"label": "D-pad Mouse Speed",
+			"address": "0x0000020C",
+			"type": "list",
+			"default": "0x0",
+			"items": [
+				{
+					"label": "Auto (game list)",
+					"value": "0x0"
+				},
+				{
+					"label": "Accelerating (1 to 6)",
+					"value": "0x61"
+				},
+				{
+					"label": "Steady slow (2)",
+					"value": "0x22"
+				},
+				{
+					"label": "Steady medium (4)",
+					"value": "0x44"
+				},
+				{
+					"label": "Steady fast (8)",
+					"value": "0x88"
+				},
+				{
+					"label": "Accelerating fast (3 to 12)",
+					"value": "0xC3"
+				}
+			]
+		},
+		{
+			"id": 6,
+			"label": "Music Volume",
+			"address": "0x00000210",
+			"type": "list",
+			"default": "0x4",
+			"items": [
+				{
+					"label": "Original (x4)",
+					"value": "0x2"
+				},
+				{
+					"label": "Loud (x8)",
+					"value": "0x3"
+				},
+				{
+					"label": "Louder (x16)",
+					"value": "0x4"
+				},
+				{
+					"label": "Loudest (x32, may clip)",
+					"value": "0x5"
+				}
 			]
 		}
 	]
