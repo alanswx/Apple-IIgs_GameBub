@@ -1,0 +1,12 @@
+{
+	"metadata": {
+		"id": "alanswx.AppleIIgs",
+		"name": "Apple IIgs",
+		"author": "Alan Steremberg",
+		"version": "0.0.1",
+		"license": "GPL-3.0"
+	},
+	"bitstreams": [
+		{"target": "gamebub_rev4", "filename": "AppleIIgs-gamebub_rev4.bit"}
+	]
+}

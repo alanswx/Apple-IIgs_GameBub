@@ -5,8 +5,7 @@
 #   scripts/lint.sh            # errors + warnings in rtl/gamebub/
 #   scripts/lint.sh --all      # every warning, including imported MiSTer RTL
 #
-# Xilinx primitives come from sim/xilinx_stubs.v. Until rtl/gamebub has a top
-# level, every module nothing instantiates is linted as its own top.
+# Xilinx primitives come from sim/xilinx_stubs.v.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 export PATH="$HOME/opt/verilator-5.052/bin:$PATH"  # Verilator 5, as scripts/env.sh
@@ -21,11 +20,12 @@ waivers=(-Wno-WIDTH -Wno-UNUSED -Wno-PINCONNECTEMPTY -Wno-DECLFILENAME
          -Wno-CASEINCOMPLETE -Wno-UNDRIVEN -Wno-SYNCASYNCNET -Wno-MULTIDRIVEN
          -Wno-BLKSEQ -Wno-PINMISSING -Wno-UNOPTFLAT -Wno-GENUNNAMED -Wno-VARHIDDEN
          -Wno-IMPORTSTAR -Wno-LATCH -Wno-COMBDLY -Wno-CASEOVERLAP -Wno-ASCRANGE
-         -Wno-PROCASSINIT -Wno-MULTITOP -Wno-CASEX -Wno-INITIALDLY)
+         -Wno-PROCASSINIT -Wno-CASEX -Wno-INITIALDLY)
 
 log=$(mktemp)
 set +e
 verilator --lint-only --timing --timescale 1ns/1ps -Wall -Wno-fatal "${waivers[@]}" \
+	--top-module iigs_gamebub \
 	"${files[@]}" >"$log" 2>&1
 status=$?
 set -e

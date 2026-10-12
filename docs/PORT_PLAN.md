@@ -145,6 +145,15 @@ Since we may not modify the framework, options are:
 Drop the border (send only the 640×200 active area). Use MacLC's
 `gb_video_out.sv` 4×4 Bayer dither to 3:3:3.
 
+**Chosen (phase 2): 320×200.** Super Hi-Res 320 mode, which nearly every
+IIgs game uses, reaches the VGC output as pixel pairs, so `gb_video_out`
+averages each pair and declares a 320×200 `VideoV0`. The framework scales it
+×2 to 640×400 on the panel, at the right aspect ratio, and its
+double-buffered store is 2 × 64000 × 9 bits (~32 BRAM36) instead of ~64.
+640 mode and 80-column text blend pixel pairs: acceptable for games. A
+640×200 build stays possible (`HALVE=0` and the Scala `videoWidth`), and
+the upstream request in (1) is still worth filing for it.
+
 ## 6. Game database (`games.tsv`)
 
 * One row per known WOZ image. Columns (draft):
@@ -212,8 +221,7 @@ useful for checking the stripped-down core before the Game Bub testbench.
    `../Apple-IIgs_MiSTer` into `rtl/iigs/` with patches (Altera IP, includes,
    `$readmemh` inlining, `.v`→`.sv`, `sys/iir_filter.v`). Lint with Verilator 5.
 2. **Strip**: new `rtl/gamebub/iigs_core.sv` replacing `Apple-IIgs.sv`: no
-   hps_io/OSD, no HDD, no TWGS, no SCC, no PRAM file, no 5.25", `RAMSIZE`
-   from the game db. Chisel wrapper `chisel/src/AppleIIgs.scala`, metadata.
+   hps_io/OSD, no HDD, no TWGS, no PRAM file, no 5.25". Chisel wrapper `chisel/src/AppleIIgs.scala`, metadata.
 3. **Simulate**: boot a WOZ game in a MacLC-style whole-core testbench
    (frames to PNG). First milestone: ROM3 boot screen, then Zany Golf title.
 4. **Floppy from SDRAM**: rework the WOZ controller to fetch track bits from
@@ -224,9 +232,36 @@ useful for checking the stripped-down core before the Game Bub testbench.
 7. **Hardware**: SD card layout, PMOD beacon, SDRAM phase tuning.
 8. **Upstream**: file the video line-doubling request (section 5).
 
+### Phase 1–2 status (2026-10-11)
+
+Done: import (`scripts/import_iigs.py`, upstream `bf80e6d`), the Game Bub
+top (`rtl/gamebub/iigs_gamebub.sv`, `iigs_core.sv`, `gb_*`), Chisel wrapper,
+metadata. Verilator lint clean; Chisel elaboration's port template matches.
+Decisions that differ from the sections above:
+
+* **SDRAM at 114.58 MHz, CL3, as upstream**, not 57 MHz: the native CPU read
+  path (ch3) is timed for it. Upstream has no SDRAM timing constraints;
+  `rtl/gamebub/iigs.xdc` is a first pass, and the read-capture window
+  (sampled two clk_mem edges after the chip edge) is the main hardware risk.
+* **ch2 gained single-word reads** (import patch). It carries the host file
+  window (writes) and `gb_blockdev` (the WOZ controller's sectors, from the
+  image in SDRAM). The CPU channels are unchanged.
+* **No byte-order detection**: the firmware sends file bytes least
+  significant first (`write_u32` uses `to_le_bytes`, files go through the
+  same SPI word path), which is the IIgs SDRAM layout; MacLC's ROM fixup is
+  not needed.
+* **SCC kept** (the ROM probes it); HDD and TWGS are stubs; 5.25" drive not
+  instantiated. **RAMSIZE is an elaboration parameter** of `iigs.sv`, so it
+  cannot come from the game db: fixed at upstream's 8 MB.
+* **Disk 2** (`.d2`) is swapped into the single 3.5" drive by the "Swap Disk"
+  action (eject + insert).
+* Video crop (`CROP_X`/`CROP_Y` in `gb_video_out.sv`) is a guess until the
+  phase 3 simulation shows the active area.
+
 ## 10. Open questions
 
-* Does a missing optional `dependent_on_0` file get skipped cleanly?
+* ~~Does a missing optional `dependent_on_0` file get skipped cleanly?~~
+  Yes: firmware `core/mod.rs` skips an optional file it cannot open.
 * Exact framework BRAM overhead (overlay, line buffers) on rev 4.
 * Which games need ROM01 vs ROM3, and how much RAM each needs.
 * Mouse feel on a d-pad for Arkanoid: may need a per-game "horizontal only,

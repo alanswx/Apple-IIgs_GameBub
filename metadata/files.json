@@ -1,0 +1,51 @@
+{
+	"files": [
+		{
+			"id": 0,
+			"label": "Game Disk",
+			"extensions": ["woz"],
+			"user_selected": true,
+			"optional": false,
+			"read_only": true,
+			"address": "0x11000000",
+			"max_size": "0x400000"
+		},
+		{
+			"id": 1,
+			"label": "Disk 2",
+			"extensions": ["d2"],
+			"dependent_on_0": true,
+			"optional": true,
+			"read_only": true,
+			"address": "0x11400000",
+			"max_size": "0x400000"
+		},
+		{
+			"id": 2,
+			"label": "ROM 3",
+			"filename": "rom3.rom",
+			"optional": true,
+			"read_only": true,
+			"address": "0x10FC0000",
+			"exact_size": "0x40000"
+		},
+		{
+			"id": 3,
+			"label": "ROM 01",
+			"filename": "rom01.rom",
+			"optional": true,
+			"read_only": true,
+			"address": "0x10F80000",
+			"exact_size": "0x20000"
+		},
+		{
+			"id": 4,
+			"label": "Game Database",
+			"filename": "gamedb.bin",
+			"optional": true,
+			"read_only": true,
+			"address": "0x11800000",
+			"max_size": "0x10000"
+		}
+	]
+}

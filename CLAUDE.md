@@ -14,6 +14,11 @@ and framework constraints, the block-RAM budget, the reuse list and the phases.
   `./mill root.buildCore --target gamebub_rev4` builds the bitstream (needs
   Vivado 2023.2+; this box has 2026.1 in `~/vivado`. 2026.1's free tier
   needs a license file renewed yearly and limits the ILA).
+* `scripts/lint.sh` lints the whole core with Verilator (no Vivado).
+  `python3 scripts/import_iigs.py` re-imports `rtl/iigs/` from upstream.
+* Chisel elaboration alone (prints the `iigs_gamebub` port template, no
+  Vivado): `./mill -i --no-build-lock root.runMain platform.handheld.HandheldTop
+  AppleIIgs 4 --target-dir=<dir>`.
 * References next to this repo: `../MacLC_GameBub` (the port we copy from),
   `../core-example` (official template), `../gamebub` (firmware and built-in
   cores).

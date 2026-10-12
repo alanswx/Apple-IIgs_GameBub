@@ -243,6 +243,47 @@ def patch_default_nettype(text, src):
     return text.rstrip("\n") + "\n// [gamebub] restore the default for the files compiled after this one\n`default_nettype wire\n"
 
 
+def patch_sdram_ch2_read(text):
+    """Single-word reads on ch2 (wrl2 = wrh2 = 0), like ch3's.
+
+    On MiSTer ch2 only receives the HPS ROM upload. On Game Bub every file
+    (ROMs, WOZ images) arrives through it, and the floppy block device, which
+    MiSTer's hps_io served from the SD card, reads and writes the disk images
+    in SDRAM through it too (rtl/gamebub/iigs_core.sv). The CPU channels and
+    their priority are untouched: ch2 stays last.
+    """
+    text = replace_once(text, "    assign dout2 = 16'd0;\n",
+                        "    reg [15:0]  word2;   // [gamebub] ch2 single-word read capture\n"
+                        "    assign dout2 = word2;\n", "sdram_burst dout2")
+    text = replace_once(
+        text,
+        "                cur <= addr2; wdata <= din2; wdqm <= ~{wrh2,wrl2};\n"
+        "                active <= 1; we <= 1; is_read <= 0; serving <= 2'd2; state <= STATE_START;\n",
+        "                // [gamebub] no byte enable = single-word read\n"
+        "                cur <= addr2; wdata <= din2; wdqm <= (wrh2 | wrl2) ? ~{wrh2,wrl2} : 2'b00;\n"
+        "                active <= 1; we <= wrh2 | wrl2; is_read <= ~(wrh2 | wrl2); serving <= 2'd2; state <= STATE_START;\n",
+        "sdram_burst ch2 dispatch")
+    text = replace_once(
+        text,
+        "            word3 <= dq_in;\n"
+        "            ack3  <= req3;\n"
+        "        end\n",
+        "            word3 <= dq_in;\n"
+        "            ack3  <= req3;\n"
+        "        end\n"
+        "        // [gamebub] ch2 single-word read, captured like ch3's\n"
+        "        if (mode == MODE_NORMAL && is_read && serving == 2'd2 && state == STATE_LDAT0) begin\n"
+        "            word2 <= dq_in;\n"
+        "            ack2  <= req2;\n"
+        "        end\n",
+        "sdram_burst ch2 read capture")
+    return replace_once(
+        text,
+        "                                        serving == 2'd3 ? {2'b00, 2'b10, cur_col}\n",
+        "                                        serving[1]      ? {2'b00, 2'b10, cur_col}  // [gamebub] ch2/ch3: exact column\n",
+        "sdram_burst read column")
+
+
 def patch_sdram_burst(text, src):
     """Artix-7 I/O for the SDRAM controller.
 
@@ -268,6 +309,7 @@ def patch_sdram_burst(text, src):
     )
     text = replace_once(text, "        dq_in <= SDRAM_DQ;\n", "        dq_in <= SDRAM_DQ_IN;\n",
                         "sdram_burst read capture")
+    text = patch_sdram_ch2_read(text)
     start = text.index("    altddio_out #(\n")
     end = text.index(");\n", text.index("sdramclk_ddr (", start)) + len(");\n")
     return text[:start] + (

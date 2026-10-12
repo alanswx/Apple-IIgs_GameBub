@@ -1,0 +1,55 @@
+{
+	"settings": [
+		{
+			"id": 0,
+			"label": "Swap Disk",
+			"address": "0x00000104",
+			"type": "action",
+			"value": "0x1"
+		},
+		{
+			"id": 1,
+			"label": "Reset",
+			"address": "0x00000100",
+			"type": "action",
+			"value": "0x1"
+		},
+		{
+			"id": 2,
+			"label": "ROM (on restart)",
+			"address": "0x00000200",
+			"type": "list",
+			"default": "0x0",
+			"items": [
+				{"label": "Auto", "value": "0x0"},
+				{"label": "ROM 3", "value": "0x1"},
+				{"label": "ROM 01", "value": "0x2"}
+			]
+		},
+		{
+			"id": 3,
+			"label": "CPU Speed",
+			"address": "0x00000204",
+			"type": "list",
+			"default": "0x0",
+			"items": [
+				{"label": "2.8 MHz (normal)", "value": "0x0"},
+				{"label": "3.6 MHz", "value": "0x1"},
+				{"label": "4.8 MHz", "value": "0x2"},
+				{"label": "7.2 MHz", "value": "0x3"},
+				{"label": "14.3 MHz", "value": "0x4"}
+			]
+		},
+		{
+			"id": 4,
+			"label": "Start In",
+			"address": "0x00000208",
+			"type": "list",
+			"default": "0x1",
+			"items": [
+				{"label": "Mouse Mode", "value": "0x1"},
+				{"label": "Keyboard Mode", "value": "0x0"}
+			]
+		}
+	]
+}

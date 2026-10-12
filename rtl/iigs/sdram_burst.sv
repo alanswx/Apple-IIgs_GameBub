@@ -85,7 +85,8 @@ module sdram_burst #(
     reg [15:0]  dq_in;   // IO-cell input capture register (see burst-beat capture)
     assign dout0 = 16'd0;
     assign dout1 = line;
-    assign dout2 = 16'd0;
+    reg [15:0]  word2;   // [gamebub] ch2 single-word read capture
+    assign dout2 = word2;
     assign dout3 = word3;
 
     localparam BURST_CODE     = 3'b011;       // burst length 8 (reads)
@@ -162,8 +163,9 @@ module sdram_burst #(
                 cur <= addr1; wdqm <= 2'b00;
                 active <= 1; we <= 0; is_read <= 1; serving <= 2'd1; state <= STATE_START;
             end else if (ack2 != req2) begin
-                cur <= addr2; wdata <= din2; wdqm <= ~{wrh2,wrl2};
-                active <= 1; we <= 1; is_read <= 0; serving <= 2'd2; state <= STATE_START;
+                // [gamebub] no byte enable = single-word read
+                cur <= addr2; wdata <= din2; wdqm <= (wrh2 | wrl2) ? ~{wrh2,wrl2} : 2'b00;
+                active <= 1; we <= wrh2 | wrl2; is_read <= ~(wrh2 | wrl2); serving <= 2'd2; state <= STATE_START;
             end else if (rfs) begin
                 rfs <= 0; active <= 0; we <= 0; is_read <= 0; state <= STATE_START;
             end
@@ -190,6 +192,11 @@ module sdram_burst #(
         if (mode == MODE_NORMAL && is_read && serving == 2'd3 && state == STATE_LDAT0) begin
             word3 <= dq_in;
             ack3  <= req3;
+        end
+        // [gamebub] ch2 single-word read, captured like ch3's
+        if (mode == MODE_NORMAL && is_read && serving == 2'd2 && state == STATE_LDAT0) begin
+            word2 <= dq_in;
+            ack2  <= req2;
         end
 
         // completion acks
@@ -230,7 +237,7 @@ module sdram_burst #(
                 // reads: ch1 line-aligned (burst walks the 8-word line); ch3
                 // at the requested column (first beat = requested word)
                 STATE_CONT:  SDRAM_A <= we             ? {wdqm, 2'b10, cur_col} :
-                                        serving == 2'd3 ? {2'b00, 2'b10, cur_col}
+                                        serving[1]      ? {2'b00, 2'b10, cur_col}  // [gamebub] ch2/ch3: exact column
                                                         : {2'b00, 2'b10, cur_col[8:3], 3'b000};
                 default: ;
             endcase
