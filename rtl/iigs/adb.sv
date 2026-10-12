@@ -286,7 +286,7 @@ function [7:0] ps2_to_apple_key;
       9'h00c: ps2_to_apple_key = 8'h76;  // F4
       9'h00d: ps2_to_apple_key = 8'h30;  // TAB
       9'h00e: ps2_to_apple_key = 8'h32;  // ~ (`)
-      9'h00f: ps2_to_apple_key = 8'h7F;  // Invalid
+      9'h00f: ps2_to_apple_key = 8'h51;  // [gamebub] keypad = (on-screen keyboard)
       9'h010: ps2_to_apple_key = 8'h7F;  // Invalid
       9'h011: ps2_to_apple_key = 8'h37;  // LEFT ALT (command)
       9'h012: ps2_to_apple_key = 8'h38;  // LEFT SHIFT

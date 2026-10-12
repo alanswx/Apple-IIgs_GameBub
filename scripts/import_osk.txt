@@ -1,0 +1,3 @@
+Marty_MiSTer commit 06075787a98427c88db447717e09fb4b066de097
+rtl/osk/osd_keyboard.sv, osk_font.hex
+Used with the author's (Jamie Blanks) permission in this GPL-3.0 core.

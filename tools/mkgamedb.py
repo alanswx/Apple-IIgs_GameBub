@@ -38,7 +38,7 @@ MAX_BYTES = 0x10000            # files.json max_size for gamedb.bin
 # PS/2 set 2 scancodes the IIgs ADB translation (rtl/iigs/adb.sv) knows.
 KEYS = {
     'none': 0x000,
-    'return': 0x05A, 'enter': 0x05A, 'space': 0x029, 'esc': 0x076,
+    'return': 0x05A, 'space': 0x029, 'esc': 0x076,
     'tab': 0x00D, 'delete': 0x066, 'backspace': 0x066,
     'up': 0x175, 'down': 0x172, 'left': 0x16B, 'right': 0x174,
     'oa': 0x011, 'cmd': 0x011, 'command': 0x011,      # Open Apple
@@ -55,6 +55,13 @@ KEYS.update(zip('abcdefghijklmnopqrstuvwxyz',
                  0x01B, 0x02C, 0x03C, 0x02A, 0x01D, 0x022, 0x035, 0x01A]))
 KEYS.update(zip('0123456789',
                 [0x045, 0x016, 0x01E, 0x026, 0x025, 0x02E, 0x036, 0x03D, 0x03E, 0x046]))
+# Apple keypad (the on-screen keyboard's keypad; kp= is PS/2 0x0F, mapped by
+# an adb.v import patch)
+KEYS.update({f'kp{d}': c for d, c in zip('0123456789',
+             [0x070, 0x069, 0x072, 0x07A, 0x06B, 0x073, 0x074, 0x06C, 0x075, 0x07D])})
+KEYS.update({'kp+': 0x079, 'kp-': 0x07B, 'kp*': 0x07C, 'kp/': 0x14A, 'kp.': 0x071,
+             'kp=': 0x00F, 'kpenter': 0x15A, 'clear': 0x077, 'reset': 0x078})
+KEYS['enter'] = 0x15A           # the keypad's Enter (Return is 'return')
 
 BUTTONS = ['a', 'b', 'x', 'y', 'l', 'r', 'start']
 # Must match the defaults in rtl/gamebub/iigs_gamebub.sv (used for unknown disks).

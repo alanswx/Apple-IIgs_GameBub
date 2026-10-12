@@ -113,7 +113,7 @@ module iigs_gamebub (
 	wire  [1:0] db_rom;
 	wire  [7:0] db_speed, db_input, db_mouse, mouse_steps;
 	wire  [2:0] doc_gain;
-	wire        disk_light;
+	wire        disk_light, controls_card;
 	wire [3:0]  dbg_disk;             // iigs_core: {motor, busy, ready, mounted}
 	wire [31:0] db_crc;
 	wire [62:0] db_keymap;
@@ -158,6 +158,7 @@ module iigs_gamebub (
 		.mouse_steps    (mouse_steps),
 		.doc_gain       (doc_gain),
 		.disk_light     (disk_light),
+		.controls_card  (controls_card),
 		.file_present   (file_present),
 		.file_size_flat (file_size_flat),
 		.dbg_blockdev   (dbg_blockdev),
@@ -288,7 +289,8 @@ module iigs_gamebub (
 
 	// ---------------------------------------------------------------------
 	// Input: Game Bub buttons in the Pocket cont1_key layout. Select
-	// toggles mouse / keyboard mode (gb_pad_input). A..Start type the keys
+	// toggles mouse / keyboard mode (gb_pad_input); holding it opens the
+	// on-screen keyboard (gb_osk). A..Start type the keys
 	// the game database gives this disk, else the defaults below (keep them
 	// in step with tools/mkgamedb.py DEFAULT_MAP). The d-pad also drives
 	// the joystick, full deflection; L and R are Open Apple and Option,
@@ -322,8 +324,12 @@ module iigs_gamebub (
 	};
 	wire [62:0] keymap = db_found ? db_keymap : DEFAULT_KEYMAP;
 
-	wire [10:0] ps2_key;
+	// The on-screen keyboard (gb_osk) takes Select holds and, while open,
+	// every button; the rest reaches the pad, and its keys join the pad's.
+	wire [15:0] pad_keys;
+	wire [10:0] pad_ps2_key, ps2_key;
 	wire [24:0] ps2_mouse;
+	wire        ptr_mode, osk_open;
 	gb_pad_input #(
 		.CLK_HZ (CLK_SYS_HZ)
 	) pad (
@@ -331,7 +337,7 @@ module iigs_gamebub (
 		// re-sampled each time the IIgs is released, so the "start in mouse
 		// mode" setting written during setup takes effect
 		.reset       (reset || core_reset),
-		.cont1_key   (cont1_key),
+		.cont1_key   (pad_keys),
 		.map_a       (keymap[8:0]),
 		.map_b       (keymap[17:9]),
 		.map_x       (keymap[26:18]),
@@ -339,16 +345,16 @@ module iigs_gamebub (
 		.map_l       (keymap[44:36]),
 		.map_r       (keymap[53:45]),
 		.map_start   (keymap[62:54]),
-		.ps2_key     (ps2_key),
+		.ps2_key     (pad_ps2_key),
 		.ps2_mouse   (ps2_mouse),
 		.ptr_default (ptr_default),
 		.step_slow   (mouse_steps[3:0]),
 		.step_fast   (mouse_steps[7:4]),
-		.ptr_mode    ()
+		.ptr_mode    (ptr_mode)
 	);
 
-	wire [7:0] joy_x = input_buttons_left ? 8'h81 : input_buttons_right ? 8'h7F : 8'h00;
-	wire [7:0] joy_y = input_buttons_up   ? 8'h81 : input_buttons_down  ? 8'h7F : 8'h00;
+	wire [7:0] joy_x = pad_keys[2] ? 8'h81 : pad_keys[3] ? 8'h7F : 8'h00;
+	wire [7:0] joy_y = pad_keys[0] ? 8'h81 : pad_keys[1] ? 8'h7F : 8'h00;
 
 	// ---------------------------------------------------------------------
 	// The IIgs
@@ -431,35 +437,43 @@ module iigs_gamebub (
 	// ---------------------------------------------------------------------
 	// Video
 	// ---------------------------------------------------------------------
-	wire [2:0] vo_r, vo_g, vo_b;
-	wire       vo_de, vo_hblank, vo_vblank;
+	// The on-screen keyboard and the status icons (drive light, input
+	// mode) are drawn on the VGC picture before it is scaled down.
+	wire [7:0] ok_r, ok_g, ok_b;
+	wire       ok_hblank, ok_vblank;
+	gb_osk #(.CLK_HZ(CLK_SYS_HZ)) osk (
+		.clk         (clk_sys),
+		.reset       (reset || core_reset),
+		.keys_in     (cont1_key),
+		.keys_out    (pad_keys),
+		.open        (osk_open),
+		.ps2_in      (pad_ps2_key),
+		.ps2_out     (ps2_key),
+		.lights_en   (disk_light),
+		.card_at_start (controls_card),
+		.keymap      (keymap),
+		.disk_active (dbg_disk[3]),      // drive motor on
+		.ptr_mode    (ptr_mode),
+		.in_r        (vid_r),
+		.in_g        (vid_g),
+		.in_b        (vid_b),
+		.in_hblank   (vid_hblank),
+		.in_vblank   (vid_vblank),
+		.out_r       (ok_r),
+		.out_g       (ok_g),
+		.out_b       (ok_b),
+		.out_hblank  (ok_hblank),
+		.out_vblank  (ok_vblank)
+	);
+
 	gb_video_out video (
 		.clk        (clk_sys),
 		.reset      (reset || core_reset),
-		.in_r       (vid_r),
-		.in_g       (vid_g),
-		.in_b       (vid_b),
-		.in_hblank  (vid_hblank),
-		.in_vblank  (vid_vblank),
-		.out_r      (vo_r),
-		.out_g      (vo_g),
-		.out_b      (vo_b),
-		.out_de     (vo_de),
-		.out_hblank (vo_hblank),
-		.out_vblank (vo_vblank)
-	);
-
-	// The 3.5" drive's "in use" light, drawn into the frame (no core LED).
-	gb_disk_light disk_lamp (
-		.clk        (clk_sys),
-		.enable     (disk_light),
-		.lit        (dbg_disk[3]),       // drive motor on
-		.in_r       (vo_r),
-		.in_g       (vo_g),
-		.in_b       (vo_b),
-		.in_de      (vo_de),
-		.in_hblank  (vo_hblank),
-		.in_vblank  (vo_vblank),
+		.in_r       (ok_r),
+		.in_g       (ok_g),
+		.in_b       (ok_b),
+		.in_hblank  (ok_hblank),
+		.in_vblank  (ok_vblank),
 		.out_r      (video_data_r),
 		.out_g      (video_data_g),
 		.out_b      (video_data_b),

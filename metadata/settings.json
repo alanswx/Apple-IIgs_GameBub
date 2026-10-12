@@ -149,13 +149,30 @@
 		},
 		{
 			"id": 7,
-			"label": "Disk Light",
+			"label": "Status Icons",
 			"address": "0x00000214",
 			"type": "list",
 			"default": "0x1",
 			"items": [
 				{
 					"label": "On (top right)",
+					"value": "0x1"
+				},
+				{
+					"label": "Off",
+					"value": "0x0"
+				}
+			]
+		},
+		{
+			"id": 8,
+			"label": "Controls Card at Start",
+			"address": "0x00000218",
+			"type": "list",
+			"default": "0x1",
+			"items": [
+				{
+					"label": "On",
 					"value": "0x1"
 				},
 				{

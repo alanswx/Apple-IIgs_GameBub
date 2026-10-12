@@ -25,6 +25,7 @@
 //   +kbd_mode       start the pad in keyboard mode (default: auto)
 //   +mouse=<hex>    d-pad pointer steps setting {fast, slow}, 0 = auto
 //   +trace_mouse    print each pointer report the pad sends
+//   +trace_keys     print each key event the IIgs receives
 //   +volume=<n>     Music Volume setting: DOC x(1 << n), 2..5 (default 4)
 //   +disk_light=<n> Disk Light setting: 1 on (default), 0 off
 //   +frames=<n>     stop after n frames (default 300)
@@ -685,6 +686,15 @@ module tb_gamebub #(
 			$display("TB MOUSE: frame %0d dx=%0d dy=%0d btn=%0d", frame,
 			         $signed({dut.ps2_mouse[4], dut.ps2_mouse[15:8]}),
 			         $signed({dut.ps2_mouse[5], dut.ps2_mouse[23:16]}), dut.ps2_mouse[0]);
+	end
+
+	// +trace_keys: the keyboard events the IIgs receives (pad + on-screen keyboard)
+	reg key_tog = 1'b0;
+	always @(posedge clk_sys) begin
+		key_tog <= dut.ps2_key[10];
+		if ($test$plusargs("trace_keys") && dut.ps2_key[10] != key_tog)
+			$display("TB KEY: frame %0d %s %03h  (osk open=%0d)", frame,
+			         dut.ps2_key[9] ? "down" : "up  ", dut.ps2_key[8:0], dut.osk_open);
 	end
 
 	// Button presses (+press=<frame>:<button>)

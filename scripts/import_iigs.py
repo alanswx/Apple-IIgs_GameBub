@@ -219,11 +219,19 @@ def patch_adb(text, src):
         "rom_adb3 adb_rom_inst ( // [gamebub] adb_rom3.hex, generated module\n",
         "adb.v ROM3 ADB ROM",
     )
-    return replace_once(
+    text = replace_once(
         text,
         'rom #(12, 8, "rtl/roms/adb_rom1.hex") adb_rom1_inst (\n',
         "rom_adb1 adb_rom1_inst ( // [gamebub] adb_rom1.hex, generated module\n",
         "adb.v ROM1 ADB ROM",
+    )
+    # PS/2 has no keypad "=" (Apple keypad, ADB 0x51); the on-screen
+    # keyboard (rtl/osk) sends the unused set 2 code 0x0F for it.
+    return replace_once(
+        text,
+        "      9'h00f: ps2_to_apple_key = 8'h7F;  // Invalid\n",
+        "      9'h00f: ps2_to_apple_key = 8'h51;  // [gamebub] keypad = (on-screen keyboard)\n",
+        "adb.v keypad =",
     )
 
 

@@ -338,9 +338,52 @@ Built as section 6 describes, with these choices:
   native speed whenever a drive motor is on (as a real ZipGS slows for
   disk access), so only the work between reads speeds up. Faster loads
   would need the drive and CPU sped up together ("fast disk").
-* "Disk Light" (`gb_disk_light.sv`): the framework gives cores no LED, so
-  a small red lamp is drawn in the frame's top-right corner while the 3.5"
-  motor runs.
+* Status icons: the framework gives cores no LED, so the on-screen
+  keyboard's strip (below) draws a floppy while the 3.5" motor runs and a
+  mouse or keyboard icon for 2 s after the input mode changes ("Status
+  Icons" setting).
+
+### On-screen keyboard (2026-10-12)
+
+`rtl/osk/` is Marty_MiSTer's on-screen keyboard (Jamie Blanks; GPL-2.0 in
+that repo, used in this GPL-3.0 core with the author's permission),
+imported by `scripts/import_osk.py` like the IIgs RTL: `osd_keyboard.sv`
+with exact-text patches (generated ROMs, 7-bit glyphs, Option sticky like
+Shift/Control/Open Apple) and `osk_rom.sv` generated from Marty's font plus
+our glyphs and a layout redrawn after the IIgs's ADB keyboard (A9M0330): no
+function keys, L-shaped Return, arrows left-right-down-up, the Apple keypad
+(clear = / *; keypad "=" is PS/2 0x0F, mapped to ADB 0x51 by an `adb.v`
+patch) and the Reset key on the strip above (F11; with sticky Control and
+Open Apple it is Ctrl-Reset / Ctrl-OA-Reset).
+
+It was built for 320-wide pictures (78 x 6 cells of 4 px, a 4-px font),
+which is ours: `gb_osk.sv` puts it on the VGC's 8-bit stream in front of
+`gb_video_out`, giving it the kept 640 x 200 area as its picture so it
+draws 2x across, exactly one output pixel per keyboard pixel after the pair
+averaging. Hold Select 0.5 s to open or close it (a tap still switches
+mouse / keyboard mode; Start also closes it). While open it owns the pad:
+d-pad moves, A types, B delete, X space, Y return, a Select tap moves it
+between top and bottom; the buttons are muted after it closes until all
+are released. Sim: opens, types (D = 0x23), closes without leaking Start.
+
+**Controls card** (`gb_help_card.sv`): when the IIgs starts ("Controls Card
+at Start", default on) a 26 x 12 character card shows what the d-pad and
+each button do in this game: the key names come from the game database's
+key map through `osk_key_name` (generated with the card text by
+`import_osk.py`), A reads CLICK in mouse mode. It goes after 10 s or at the
+first button press after 1 s; the keyboard's HELP key (top row, code 0x1FF,
+never sent to the IIgs) brings it back.
+
+**Per-game maps from manuals.** whatisthe2gs.apple2.org.za lists a Control
+field (mouse / joystick / keyboard) for 176 IIgs games and links 76 manual
+PDFs. 128 of those games are on the WOZ disks; the 61 with manuals were
+read (pdftotext, page images for scans) into `games.tsv` rows: start mode,
+pointer speed, button keys and a notes column naming the controls and the
+keys left to the on-screen keyboard (marked [manual]); the other 67 take
+their start mode from the Control field ([site]). Joystick games start in
+keyboard mode with A = Open Apple and B = Option, the IIgs's joystick
+buttons 0 and 1. These are unplayed first guesses: correct them on
+hardware. The manuals themselves are copyrighted and stay out of git.
 * Not done yet: joystick-only mode, settings actions for extra keys.
 
 ### Sound level (2026-10-12)
