@@ -155,7 +155,7 @@
 			"default": "0x1",
 			"items": [
 				{
-					"label": "On (top right)",
+					"label": "On (top left)",
 					"value": "0x1"
 				},
 				{
